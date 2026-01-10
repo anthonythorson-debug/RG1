@@ -1,0 +1,15 @@
+local StatsConfig = {
+	Colors = {
+		Health = Color3.fromHex("#a30707"),
+		Mana   = Color3.fromHex("#009aed"),
+		TP     = Color3.fromHex("#ffd700"),
+	},
+	Defaults = {                -- NEW
+		HealthMax = 100,
+		ManaMax   = 100,
+		TPMax     = 100,
+	},
+	FillTweenTime = 0.25,
+	PercentClamp  = true,
+}
+return StatsConfig
