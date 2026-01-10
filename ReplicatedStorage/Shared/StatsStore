@@ -1,0 +1,41 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local StatsStore = {}
+StatsStore.__index = StatsStore
+
+local StatsConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("StatsConfig"))
+
+local function mkStat(cur, max)
+	return {current = cur or 0, max = max or 100}
+end
+
+function StatsStore.new()
+	local self = setmetatable({}, StatsStore)
+	self.health = mkStat(StatsConfig.Defaults.HealthMax, StatsConfig.Defaults.HealthMax) -- 100/100
+	self.mana   = mkStat(StatsConfig.Defaults.ManaMax,   StatsConfig.Defaults.ManaMax)   -- 100/100
+	self.tp     = mkStat(0,                               StatsConfig.Defaults.TPMax)     -- 0/100
+	self.changed = Instance.new("BindableEvent")
+	return self
+end
+
+function StatsStore:set(name, cur, max)
+    local stat = self[name]; if not stat then return end
+    if typeof(cur) == "number" then stat.current = cur end
+    if typeof(max) == "number" then stat.max     = max end
+    self.changed:Fire(name, stat.current, stat.max)
+end
+
+function StatsStore:delta(name, dcur, dmax)
+    local stat = self[name]; if not stat then return end
+    if typeof(dcur) == "number" then stat.current = stat.current + dcur end
+    if typeof(dmax) == "number" then stat.max     = stat.max + dmax end
+    self.changed:Fire(name, stat.current, stat.max)
+end
+
+function StatsStore:pct(name)
+    local s = self[name]; if not s or s.max <= 0 then return 0 end
+    local p = math.clamp(s.current / s.max, 0, 1)
+    return p
+end
+
+return StatsStore
