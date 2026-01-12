@@ -1,0 +1,28 @@
+-- BallConfig.lua
+local M = {}
+
+-- THROW / PHYSICS
+M.THROW_SPEED = 140       -- studs/sec (easy to tweak)
+M.EXTRA_UPWARD = 0        -- add a little loft if you want, e.g., 10
+M.GRAVITY = workspace.Gravity -- or override (e.g., 196.2)
+
+-- PROJECTILE
+M.BALL_DIAMETER = 2.5
+M.BALL_COLOR = Color3.fromRGB(255, 170, 0)
+M.BALL_MATERIAL = Enum.Material.Neon
+M.BALL_LIFETIME = 8       -- seconds (auto-cleanup if it never hits)
+M.CAN_COLLIDE = true
+
+-- EXPLOSION / TERRAIN
+M.EXPLOSION_RADIUS = 5   -- studs (carves this radius out of Terrain)
+M.EXPLOSION_FORCE = 50     -- optional physics push; set >0 to use Instance.new("Explosion")
+M.DESTROY_TERRAIN = true  -- if true, cuts a hole using FillBall
+
+-- SAFETY
+M.SELF_HIT_COOLDOWN = 0.2 -- seconds before your own ball can hit you
+
+-- OPTIONAL VFX/SFX (Asset IDs or nil)
+M.SOUND_ID = nil          -- e.g., "rbxassetid://12345678"
+M.PARTICLE = nil          -- you can parent a ParticleEmitter later
+
+return M

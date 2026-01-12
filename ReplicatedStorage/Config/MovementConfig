@@ -1,0 +1,153 @@
+-- MovementConfig (ModuleScript)
+
+local MovementConfig = {
+	-- ===== Base Movement =====
+	WalkSpeed = 16,
+	SprintSpeed = 24,
+	JumpPower = 52,
+	UseJumpHeight = false,
+	JumpHeight = 7.2,
+	Gravity = 196.2,
+	-- Double-jump tuning
+	EnableDoubleJump        = true,
+	DoubleJumpMultiplier    = 0.75,   -- 75% of normal jump power
+	DoubleJumpCooldown      = 0.18,   -- seconds, anti-spam
+	DoubleJumpStaminaCost   = 20,     -- optional; only used if StaminaClient supports it
+	DoubleJumpArmDelay   = 0.25,  -- seconds after takeoff before 2nd jump can trigger
+
+
+	
+	-- Stamina (client stub defaults)
+	MaxStamina          = 100,   -- total stamina pool
+	StaminaRegenRate    = 25,    -- per second
+	StaminaRegenDelay   = 0.60,  -- seconds after spending before regen resumes
+
+	-- Shockwave VFX
+	ShockwaveInitialSize    = 6,      -- diameter (X/Z)
+	ShockwaveFinalSize      = 28,     -- diameter (X/Z)
+	ShockwaveThickness      = 0.25,   -- only for cylinder fallback
+	ShockwaveDuration       = 0.35,   -- seconds
+	ShockwaveYOffset        = 2.25,   -- below root
+
+	-- ===== Camera =====
+	BaseFOV = 70,
+	SprintFOV = 85,
+	FOVTweenTime = 0.18,
+	FOVTweenStyle = Enum.EasingStyle.Linear,
+	FOVTweenDirection = Enum.EasingDirection.Out,
+
+	-- ===== Controls =====
+	Input = {
+		Keyboard = {
+			Mode = "Hold", -- "Hold" or "Toggle"
+			SprintKey = Enum.KeyCode.LeftShift,
+			AltSprintKey = Enum.KeyCode.RightShift,
+		},
+		Gamepad = {
+			Mode = "Toggle", -- controller uses Toggle
+			SprintKey = Enum.KeyCode.ButtonL3, -- L3 click
+		},
+	},
+
+	-- ===== Animations =====
+	SprintAnimationId = nil, -- not used if ANIMS.SPRINT is set
+	BlendWeight = 1.0,
+	FadeTime = 0.12,
+
+	-- ===== Behavior toggles =====
+	SprintRequiresMovement = true,
+	StopSprintOnZeroMove = true,
+	StopSprintWhenAirborne = false,
+	RespectStates = {
+		[Enum.HumanoidStateType.Seated] = true,
+		[Enum.HumanoidStateType.Dead] = true,
+	},
+
+	-- ===== Global modifiers =====
+	SpeedMultiplier = 1.0,
+	FOVAdditive = 0.0,
+}
+
+-- Directional sprint gating (aligned to camera forward)
+MovementConfig.Directional = {
+	ForwardOnly = true,
+	MinForwardDot = 0.25,
+}
+
+-- Animation IDs (fill these as you create them)
+MovementConfig.ANIMS = {
+	WALK        = "rbxassetid://119285098140673",
+	SPRINT      = "rbxassetid://138276562483990",
+	CROUCH_IDLE = "rbxassetid://84446468029000",
+	SLIDE       = "rbxassetid://116947659352124",
+	
+	JUMP1       = "rbxassetid://507765000",
+	JUMP2       = "rbxassetid://137755204552744",
+}
+
+-- ===== Dash Animations (fill yours in) =====
+-- If any are empty, the controller will skip playing that track (dash still works)
+MovementConfig.ANIMS = MovementConfig.ANIMS or {}
+MovementConfig.ANIMS.DASH = {
+	FORWARD = "rbxassetid://123505063819927",
+	LEFT    = "rbxassetid://123505063819927",--change ts
+	RIGHT   = "rbxassetid://123505063819927",--change ts
+	BACK    = "rbxassetid://123505063819927",--change ts
+}
+
+-- ===== Dash Settings =====
+MovementConfig.Dash = {
+	-- Input
+	Input = {
+		KeyboardKey = Enum.KeyCode.Q,
+		GamepadKey  = Enum.KeyCode.ButtonB, -- Xbox B / PS Circle
+	},
+
+	-- Durations (seconds) and speeds (studs/sec)
+	Forward = { Duration = 0.42, Speed = 70, Cooldown = 5.0, MidDashSteer = true  },
+	Side    = { Duration = 0.09, Speed = 90, Cooldown = 3.0, MidDashSteer = false },
+	Back    = { Duration = 0.09, Speed = 75, Cooldown = 3.0, MidDashSteer = false },
+
+	-- Camera FOV bump during dash
+	FOV = {
+		Target = 95,            -- FOV during dash
+		UpTime = 0.08,          -- time to reach dash FOV
+		DownTime = 0.12,        -- time to return to base FOV
+	},
+
+	-- How we decide direction from input vector
+	DirectionDotThreshold = 0.50, -- >= 0.5 means “mostly that way”
+}
+
+-- ===== Dash VFX (speed lines) =====
+MovementConfig.DashVFX = {
+	Enabled = true,
+
+	-- How many separate lines around the outline
+	LineCount = 10,          -- 🔧 adjust
+	LineCountJitter = 4,     -- random extra +/- lines
+
+	-- Shape of the ring around the body
+	Radius = 1.6,            -- distance from HRP center
+	VerticalSpread = 1.2,    -- how tall the ring is (0 = flat ring at HRP)
+
+	-- How far the trailing end sits behind during dash
+	BackOffset = 1.0,        -- studs behind HRP along dash direction
+
+	-- Trail look/feel
+	Lifetime = 0.22,         -- how long each streak persists
+	WidthMin = 0.06,
+	WidthMax = 0.14,
+	Transparency = NumberSequence.new{
+		NumberSequenceKeypoint.new(0.00, 0.10),
+		NumberSequenceKeypoint.new(0.60, 0.35),
+		NumberSequenceKeypoint.new(1.00, 1.00),
+	},
+
+	-- Color: each line randomly black OR white
+	WhiteChance = 0.5,       -- 0..1
+}
+
+
+
+return MovementConfig

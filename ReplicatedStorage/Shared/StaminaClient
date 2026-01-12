@@ -1,0 +1,103 @@
+-- Shared/StaminaClient.lua (client-side stub)
+-- Exposes: TryConsume(cost) -> bool, Get(), Set(v), Percent(), OnChanged(event)
+-- Stores stamina as NumberValue under the local Player for easy UI binding.
+
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+-- Pull MovementConfig for defaults
+local ConfigFolder   = ReplicatedStorage:WaitForChild("Config")
+local MovementConfig = require(ConfigFolder:WaitForChild("MovementConfig"))
+
+local MaxStamina        = MovementConfig.MaxStamina or 100
+local RegenRatePerSec   = MovementConfig.StaminaRegenRate or 25
+local RegenDelay        = MovementConfig.StaminaRegenDelay or 0.6
+
+-- Backing NumberValue (so UI can bind)
+local staminaVal = player:FindFirstChild("Stamina")
+if not staminaVal then
+	staminaVal = Instance.new("NumberValue")
+	staminaVal.Name = "Stamina"
+	staminaVal.Value = MaxStamina
+	staminaVal.Parent = player
+end
+
+-- Simple signal (BindableEvent) for change notifications if needed
+local changedEvent = Instance.new("BindableEvent")
+
+-- Regen control
+local lastSpendTime = -1e9
+local regenConn     = nil
+
+local function clamp(n, lo, hi)
+	return math.max(lo, math.min(hi, n))
+end
+
+local function step(dt)
+	-- wait RegenDelay after last spend
+	if (time() - lastSpendTime) < RegenDelay then return end
+	if staminaVal.Value >= MaxStamina then return end
+
+	local add = RegenRatePerSec * dt
+	if add > 0 then
+		local before = staminaVal.Value
+		staminaVal.Value = clamp(before + add, 0, MaxStamina)
+		if staminaVal.Value ~= before then
+			changedEvent:Fire(staminaVal.Value, MaxStamina)
+		end
+	end
+end
+
+-- Start regen loop once per client
+if not regenConn then
+	regenConn = RunService.RenderStepped:Connect(step)
+end
+
+local M = {}
+
+function M.TryConsume(cost:number): boolean
+	cost = math.max(0, cost or 0)
+	if cost == 0 then return true end
+
+	if staminaVal.Value >= cost then
+		staminaVal.Value = staminaVal.Value - cost
+		lastSpendTime = time()
+		changedEvent:Fire(staminaVal.Value, MaxStamina)
+		return true
+	end
+	return false
+end
+
+function M.Get(): number
+	return staminaVal.Value
+end
+
+function M.Set(v:number)
+	local before = staminaVal.Value
+	staminaVal.Value = clamp(v or before, 0, MaxStamina)
+	if staminaVal.Value ~= before then
+		changedEvent:Fire(staminaVal.Value, MaxStamina)
+	end
+end
+
+function M.Percent(): number
+	return (staminaVal.Value / MaxStamina)
+end
+
+function M.OnChanged(callback: (current:number, max:number)->())
+	return changedEvent.Event:Connect(callback)
+end
+
+function M.SetMax(newMax:number)
+	newMax = math.max(1, newMax or MaxStamina)
+	MaxStamina = newMax
+	if staminaVal.Value > MaxStamina then
+		staminaVal.Value = MaxStamina
+		changedEvent:Fire(staminaVal.Value, MaxStamina)
+	end
+end
+
+return M
