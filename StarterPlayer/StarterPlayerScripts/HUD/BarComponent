@@ -1,0 +1,72 @@
+local TweenService = game:GetService("TweenService")
+
+local BarComponent = {}
+BarComponent.__index = BarComponent
+
+function BarComponent.new(imageLabel, fillTweenTime, fillsBottomToTop)
+	local self = setmetatable({}, BarComponent)
+	self.gui = imageLabel
+	self.label = imageLabel:FindFirstChild("Percent")
+	self.grad = imageLabel:FindFirstChildOfClass("UIGradient")
+	self.fillTweenTime = fillTweenTime or 0.25
+	self.bottomUp = fillsBottomToTop and true or false
+	self._tween = nil
+	self._curPercent = 1
+	return self
+end
+
+-- Helper to build a transparency NumberSequence for a given percent
+local function makeSeq(pct, bottomUp)
+	local k = NumberSequenceKeypoint
+	if bottomUp then
+		return NumberSequence.new({
+			k.new(0,   0),
+			k.new(pct, 0),
+			k.new(pct, 1),
+			k.new(1,   1),
+		})
+	else
+		return NumberSequence.new({
+			k.new(0,   1),
+			k.new(1-pct, 1),
+			k.new(1-pct, 0),
+			k.new(1,   0),
+		})
+	end
+end
+
+function BarComponent:setPercent(pct)
+	pct = math.clamp(pct or 0, 0, 1)
+	local oldPct = self._curPercent
+	self._curPercent = pct
+
+	if self._tween then
+		self._tween:Cancel()
+	end
+
+	-- Tween between oldPct → pct smoothly
+	local val = Instance.new("NumberValue")
+	val.Value = oldPct
+	self._tween = TweenService:Create(
+		val,
+		TweenInfo.new(self.fillTweenTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{Value = pct}
+	)
+	self._tween.Completed:Connect(function()
+		val:Destroy()
+		self._tween = nil
+	end)
+	val.Changed:Connect(function(v)
+		if self.grad then
+			self.grad.Transparency = makeSeq(v, self.bottomUp)
+		end
+	end)
+	self._tween:Play()
+
+	-- Update label text
+	if self.label then
+		self.label.Text = string.format("%d%%", math.floor(pct * 100 + 0.5))
+	end
+end
+
+return BarComponent
