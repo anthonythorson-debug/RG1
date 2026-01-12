@@ -1,0 +1,108 @@
+-- ClientThrow (LocalScript inside the BoomBall Tool)
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+local UIS     = game:GetService("UserInputService")
+local CAS     = game:GetService("ContextActionService")
+
+local player  = Players.LocalPlayer
+local mouse   = player:GetMouse()
+local tool    = script.Parent
+local throwEvent = RS:WaitForChild("RemoteEvents"):WaitForChild("ThrowBall")
+
+local ACTION_NAME = "BoomBall_R2"
+local DEBUG = false
+
+local function dprint(...)
+	if DEBUG then print("[BoomBall][Client]", ...) end
+end
+
+local function getAim()
+	local cam = workspace.CurrentCamera
+	if not cam then return nil, nil end
+
+	local origin = cam.CFrame.Position
+	-- If Shift-Lock (mouse locked to center), use camera forward (crosshair)
+	if UIS.MouseBehavior == Enum.MouseBehavior.LockCenter then
+		return origin, cam.CFrame.LookVector
+	end
+
+	-- Otherwise ray to mouse.Hit
+	local hitPos = mouse and mouse.Hit and mouse.Hit.Position
+	if hitPos then
+		local dir = (hitPos - origin)
+		if dir.Magnitude > 1e-3 then
+			return origin, dir.Unit
+		end
+	end
+	return origin, cam.CFrame.LookVector
+end
+
+local function isEquipped()
+	return tool and tool.Parent == player.Character
+end
+
+local function doThrow(tag)
+	if not isEquipped() then return end
+	if not throwEvent then return end
+	local _, dir = getAim()
+	if not dir then return end
+	dprint("Throw", tag)
+	-- We only send direction; server spawns in front of HRP
+	throwEvent:FireServer(dir)
+end
+
+-- Universal: often fires for click/tap/R2, but not always on every setup
+tool.Activated:Connect(function()
+	doThrow("Activated")
+end)
+
+-- Explicit mouse left click
+UIS.InputBegan:Connect(function(input, gameProcessed)
+	-- For mouse, respect gameProcessed to avoid UI conflicts
+	if gameProcessed then return end
+	if not isEquipped() then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		doThrow("MouseButton1")
+	end
+end)
+
+-- High-priority CAS bind for R2
+local function gamepadThrowAction(_, inputState)
+	if inputState == Enum.UserInputState.Begin then
+		doThrow("CAS_R2")
+	end
+	return Enum.ContextActionResult.Sink
+end
+
+-- Fallback: direct UIS for Gamepad1 R2 (ignore gameProcessed; tool guard prevents spam)
+UIS.InputBegan:Connect(function(input, _gameProcessed)
+	if not isEquipped() then return end
+	if input.UserInputType == Enum.UserInputType.Gamepad1
+		and input.KeyCode == Enum.KeyCode.ButtonR2
+		and input.UserInputState == Enum.UserInputState.Begin then
+		doThrow("UIS_R2")
+	end
+end)
+
+-- Bind/unbind when the tool is (un)equipped
+tool.Equipped:Connect(function()
+	-- Use high priority to beat default bindings that might swallow R2
+	if CAS.BindActionAtPriority then
+		CAS:BindActionAtPriority(
+			ACTION_NAME,
+			gamepadThrowAction,
+			false,
+			Enum.ContextActionPriority.High.Value,
+			Enum.KeyCode.ButtonR2
+		)
+	else
+		-- Studio versions without AtPriority
+		CAS:BindAction(ACTION_NAME, gamepadThrowAction, false, Enum.KeyCode.ButtonR2)
+	end
+	dprint("Equipped: R2 bound")
+end)
+
+tool.Unequipped:Connect(function()
+	CAS:UnbindAction(ACTION_NAME)
+	dprint("Unequipped: R2 unbound")
+end)
