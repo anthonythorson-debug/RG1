@@ -1,0 +1,384 @@
+-- CustomShiftLock.client.lua
+-- Shift-lock with slight left offset, crosshair, controller cursor in inventory,
+-- + Max Zoom Cap, + "kinda lock where you look" strafing yaw offset.
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local CAS = game:GetService("ContextActionService")
+
+local player = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- ===== Config =====
+local CAMERA_OFFSET               = Vector3.new(1.4, 0, 0) -- slight left
+local MAX_ZOOM_DISTANCE           = 16                      -- clamp scroll zoom-out (studs)
+local CONTROLLER_CURSOR_SPEED     = 1200                   -- px/sec
+local CROSSHAIR_SIZE              = 10                     -- px
+local CONTROLLER_CURSOR_SIZE      = 14                     -- px
+
+-- "Kinda lock" strafing: yaw adjustments (in degrees) when holding left/right
+local STRAFE_YAW_OFFSET_DEG       = -10                     -- default angle
+local STRAFE_YAW_SMOOTH           = 0.15                   -- 0..1 lerp per frame (smaller = smoother)
+local BODY_TURN_SMOOTH            = 0.20                   -- 0..1 lerp per frame
+local GAMEPAD_DEADZONE            = 0.15                   -- left-stick X deadzone
+
+-- Shift-lock defaults and bindings
+local DEFAULT_SHIFTLOCK_ON       = true
+local KB_TOGGLE_KEY              = Enum.KeyCode.LeftAlt
+local desiredShiftLock = DEFAULT_SHIFTLOCK_ON
+
+-- Decide later: set this to a controller key (e.g., Enum.KeyCode.ButtonL3) or leave nil
+local GP_TOGGLE_KEY              = nil  -- e.g., Enum.KeyCode.ButtonL3
+
+--newly added
+-- Block gamepad camera look while inventory/menu is open
+local BLOCK_ACTION = "BlockGamepadLook"
+local function blockGamepadLook(_, _state, _input)
+	-- Always consume right-stick input so the default camera never sees it
+	return Enum.ContextActionResult.Sink
+end
+
+local function enableBlockGamepadLook()
+	-- Prefer high priority so we beat CoreScripts camera
+	if CAS.BindActionAtPriority then
+		CAS:BindActionAtPriority(BLOCK_ACTION, blockGamepadLook, false, 3000, Enum.KeyCode.Thumbstick2)
+	else
+		CAS:BindAction(BLOCK_ACTION, blockGamepadLook, false, Enum.KeyCode.Thumbstick2)
+	end
+	-- Optional: also sink R3 (pressing the right stick) to avoid any default toggles
+	if CAS.BindActionAtPriority then
+		CAS:BindActionAtPriority(BLOCK_ACTION .. "_R3", blockGamepadLook, false, 3000, Enum.KeyCode.ButtonR3)
+	else
+		CAS:BindAction(BLOCK_ACTION .. "_R3", blockGamepadLook, false, Enum.KeyCode.ButtonR3)
+	end
+end
+
+local function disableBlockGamepadLook()
+	CAS:UnbindAction(BLOCK_ACTION)
+	CAS:UnbindAction(BLOCK_ACTION .. "_R3")
+end
+
+--end of newly added
+-- ===== Shared inventory signal =====
+local invSignal = RS:FindFirstChild("InventoryToggled")
+if not invSignal then
+	invSignal = Instance.new("BindableEvent")
+	invSignal.Name = "InventoryToggled"
+	invSignal.Parent = RS
+end
+
+-- ===== UI: crosshair + controller cursor =====
+local ui = Instance.new("ScreenGui")
+ui.Name = "CustomShiftLockUI"
+ui.ResetOnSpawn = false
+ui.IgnoreGuiInset = true
+ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ui.Parent = player:WaitForChild("PlayerGui")
+
+local crosshair = Instance.new("Frame")
+crosshair.Name = "Crosshair"
+crosshair.AnchorPoint = Vector2.new(0.5, 0.5)
+crosshair.Size = UDim2.fromOffset(CROSSHAIR_SIZE, CROSSHAIR_SIZE)
+crosshair.Position = UDim2.fromScale(0.5, 0.5)
+crosshair.BackgroundColor3 = Color3.fromRGB(240, 240, 240)
+crosshair.BorderSizePixel = 0
+crosshair.Visible = true
+crosshair.Parent = ui
+local crossCorner = Instance.new("UICorner")
+crossCorner.CornerRadius = UDim.new(1, 0)
+crossCorner.Parent = crosshair
+
+local gamepadCursor = Instance.new("Frame")
+gamepadCursor.Name = "GamepadCursor"
+gamepadCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+gamepadCursor.Size = UDim2.fromOffset(CONTROLLER_CURSOR_SIZE, CONTROLLER_CURSOR_SIZE)
+gamepadCursor.Position = UDim2.fromScale(0.5, 0.5)
+gamepadCursor.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+gamepadCursor.BorderSizePixel = 0
+gamepadCursor.Visible = false
+gamepadCursor.Parent = ui
+local gpCorner = Instance.new("UICorner")
+gpCorner.CornerRadius = UDim.new(1, 0)
+gpCorner.Parent = gamepadCursor
+
+local function clampPos(x, y)
+	local vw = ui.AbsoluteSize.X
+	local vh = ui.AbsoluteSize.Y
+	x = math.clamp(x, 0, vw)
+	y = math.clamp(y, 0, vh)
+	return x, y
+end
+
+local gpPos = Vector2.new(ui.AbsoluteSize.X/2, ui.AbsoluteSize.Y/2)
+ui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	gpPos = Vector2.new(ui.AbsoluteSize.X/2, ui.AbsoluteSize.Y/2)
+	gamepadCursor.Position = UDim2.fromOffset(gpPos.X, gpPos.Y)
+end)
+
+-- ===== Character / humanoid state =====
+local humanoid: Humanoid? = nil
+local root: BasePart? = nil
+local isShiftLocked = false
+local inventoryOpen = false
+local lastAutoRotate = true
+
+-- Current strafing yaw (degrees) applied on top of camera yaw
+local currentStrafeYaw = 0
+
+local function getHumanoid()
+	local char = player.Character or player.CharacterAdded:Wait()
+	humanoid = char:WaitForChild("Humanoid") :: Humanoid
+	root = (char:WaitForChild("HumanoidRootPart") :: BasePart)
+	return humanoid
+end
+
+local function setZoomClamp()
+	-- Respect user minimum; cap their maximum
+	player.CameraMinZoomDistance = math.min(player.CameraMinZoomDistance or 0.5, 0.5)
+	player.CameraMaxZoomDistance = MAX_ZOOM_DISTANCE
+end
+
+local function applyCameraOffset(enabled: boolean)
+	if not humanoid then return end
+	humanoid.CameraOffset = enabled and CAMERA_OFFSET or Vector3.zero
+end
+
+local function enableCustomShiftLock()
+	if not humanoid then return end
+	isShiftLocked = true
+	applyCameraOffset(true)
+	-- Prevent Roblox from rotating character to MoveDirection
+	lastAutoRotate = humanoid.AutoRotate
+	humanoid.AutoRotate = false
+
+	-- Lock mouse, show crosshair, hide system cursor
+	UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
+	UIS.MouseIconEnabled = false
+	crosshair.Visible = true
+	gamepadCursor.Visible = false
+end
+
+local function disableCustomShiftLock()
+	if not humanoid then return end
+	isShiftLocked = false
+	applyCameraOffset(false)
+	-- Restore autorotate so player can freely use cursor/UI
+	humanoid.AutoRotate = lastAutoRotate
+
+	UIS.MouseBehavior = Enum.MouseBehavior.Default
+	UIS.MouseIconEnabled = true
+	crosshair.Visible = false
+	-- gamepad cursor controlled by inventory state
+end
+
+local function setShiftLockEnabled(enabled: boolean)
+	desiredShiftLock = enabled
+	if inventoryOpen then
+		-- Inventory force-disables regardless; remember desire for later
+		return
+	end
+	if enabled then
+		enableCustomShiftLock()
+	else
+		disableCustomShiftLock()
+	end
+end
+
+local function onCharacterAdded()
+	getHumanoid()
+	task.wait(0.05)
+	setZoomClamp()
+	setShiftLockEnabled(desiredShiftLock)
+end
+
+if player.Character then
+	task.spawn(onCharacterAdded)
+end
+player.CharacterAdded:Connect(onCharacterAdded)
+
+
+local function toggleShiftLock()
+	setShiftLockEnabled(not desiredShiftLock)
+end
+
+
+-- Block right-click camera look
+local function blockRightMouse(_, state)
+	if state == Enum.UserInputState.Begin then
+		return Enum.ContextActionResult.Sink
+	end
+	return Enum.ContextActionResult.Sink
+end
+CAS:BindAction("BlockRightMouse", blockRightMouse, false, Enum.UserInputType.MouseButton2)
+
+local TOGGLE_SHIFTLOCK_ACTION = "ToggleCustomShiftLock"
+
+local function onToggleShiftLock(_, state, input)
+	if state ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+	-- Ignore toggles while inventory is open; your menu owns input then
+	if inventoryOpen then return Enum.ContextActionResult.Sink end
+	toggleShiftLock()
+	return Enum.ContextActionResult.Sink
+end
+
+-- Keyboard bind
+CAS:BindAction(TOGGLE_SHIFTLOCK_ACTION, onToggleShiftLock, false, KB_TOGGLE_KEY)
+
+-- Optional: controller bind (decide later by setting GP_TOGGLE_KEY above)
+if GP_TOGGLE_KEY then
+	CAS:BindAction(TOGGLE_SHIFTLOCK_ACTION .. "_GP", onToggleShiftLock, false, GP_TOGGLE_KEY)
+end
+
+
+-- Inventory open/close
+invSignal.Event:Connect(function(open: boolean)
+	inventoryOpen = open
+	if open then
+		-- Freeze camera look and disable shift-lock visuals/behavior
+		disableCustomShiftLock()
+		enableBlockGamepadLook()
+		if UIS.GamepadEnabled then
+			gamepadCursor.Visible = true
+			UIS.MouseIconEnabled = false
+		end
+	else
+		-- Restore camera control and reapply the player's desired shift-lock state
+		disableBlockGamepadLook()
+		setShiftLockEnabled(desiredShiftLock)
+	end
+end)
+
+
+
+-- Helpers
+local function yawFromLook(v3: Vector3): number
+	-- project look vector to XZ plane, get yaw in radians
+	local lv = Vector3.new(v3.X, 0, v3.Z)
+	if lv.Magnitude < 1e-5 then return 0 end
+	lv = lv.Unit
+	-- atan2(Z, X) with Roblox forward (Z-) conventions -> use atan2(lv.X, lv.Z)
+	return math.atan2(lv.X, lv.Z)
+end
+
+local function lerpAngleDeg(a: number, b: number, t: number): number
+	-- shortest-path lerp in degrees
+	local delta = (b - a + 180) % 360 - 180
+	return a + delta * t
+end
+
+-- Read strafing intent (keyboard + gamepad)
+local function getStrafeInput()
+	-- Keyboard A/D
+	local left = UIS:IsKeyDown(Enum.KeyCode.A)
+	local right = UIS:IsKeyDown(Enum.KeyCode.D)
+
+	-- Gamepad left-stick X
+	if UIS.GamepadEnabled then
+		local state = UIS:GetGamepadState(Enum.UserInputType.Gamepad1)
+		for _, inp in ipairs(state) do
+			if inp.KeyCode == Enum.KeyCode.Thumbstick1 then
+				local x = inp.Position.X
+				if math.abs(x) > GAMEPAD_DEADZONE then
+					if x < 0 then left = true right = false
+					elseif x > 0 then right = true left = false end
+				end
+				break
+			end
+		end
+	end
+
+	if left and not right then
+		return -1
+	elseif right and not left then
+		return 1
+	else
+		return 0
+	end
+end
+
+-- Per-frame behavior
+RunService.RenderStepped:Connect(function(dt)
+	-- Enforce zoom cap every frame (players can change settings at runtime)
+	setZoomClamp()
+
+	if inventoryOpen or not isShiftLocked or not humanoid or not root then
+		-- Inventory: manage controller cursor movement
+		if inventoryOpen and UIS.GamepadEnabled then
+			local state = UIS:GetGamepadState(Enum.UserInputType.Gamepad1)
+			local rightStick
+			for _, inp in ipairs(state) do
+				if inp.KeyCode == Enum.KeyCode.Thumbstick2 then
+					rightStick = inp
+					break
+				end
+			end
+			if rightStick then
+				local delta = rightStick.Position
+				-- deadzone
+				local dx = (math.abs(delta.X) > 0.1) and delta.X or 0
+				local dy = (math.abs(delta.Y) > 0.1) and delta.Y or 0
+				local move = Vector2.new(dx, -dy) * CONTROLLER_CURSOR_SPEED * dt
+				local nx, ny = clampPos(gpPos.X + move.X, gpPos.Y + move.Y)
+				gpPos = Vector2.new(nx, ny)
+				gamepadCursor.Position = UDim2.fromOffset(gpPos.X, gpPos.Y)
+			end
+		end
+		return
+	end
+
+	-- Maintain mouse-locked center while shift-locked
+	UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
+	UIS.MouseIconEnabled = false
+	crosshair.Visible = true
+	gamepadCursor.Visible = false
+
+	-- === Replace the whole "compute desired character yaw" block with this ===
+
+	-- Camera forward flattened to XZ
+	local camLV = cam.CFrame.LookVector
+	local flatLook = Vector3.new(camLV.X, 0, camLV.Z)
+	if flatLook.Magnitude > 1e-5 then
+		flatLook = flatLook.Unit
+	else
+		flatLook = Vector3.new(0, 0, -1) -- sensible default
+	end
+
+	-- Read strafing (A/D or left stick) and target small yaw
+	local strafeDir = getStrafeInput() -- -1,0,1
+	local targetStrafeYaw = (strafeDir ~= 0) and (STRAFE_YAW_OFFSET_DEG * strafeDir) or 0
+	currentStrafeYaw = lerpAngleDeg(currentStrafeYaw, targetStrafeYaw, STRAFE_YAW_SMOOTH)
+
+	-- Base facing exactly where the camera looks (character forward = -Z)
+	local pos = root.CFrame.Position
+	local baseCF = CFrame.lookAt(pos, pos + flatLook)
+
+	-- Apply small left/right offset (in radians) on top of the camera-facing CF
+	local desiredCF = baseCF * CFrame.Angles(0, math.rad(currentStrafeYaw), 0)
+
+	-- Smooth rotate body toward desired
+	root.CFrame = root.CFrame:Lerp(desiredCF, BODY_TURN_SMOOTH)
+
+end)
+
+-- Character lifecycle
+local function onCharacterAdded()
+	getHumanoid()
+	task.wait(0.05)
+	if humanoid then
+		enableCustomShiftLock()
+		setZoomClamp()
+	end
+end
+
+if player.Character then
+	task.spawn(onCharacterAdded)
+end
+player.CharacterAdded:Connect(onCharacterAdded)
+
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	if isShiftLocked and not inventoryOpen then
+		enableCustomShiftLock()
+	end
+end)
