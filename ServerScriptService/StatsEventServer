@@ -1,0 +1,58 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local RE = ReplicatedStorage:WaitForChild("RemoteEvents")
+local Combat = RE:WaitForChild("Combat")
+local ManaRE = RE:WaitForChild("Mana")
+local PlayerDamaged  = Combat:WaitForChild("PlayerDamaged")
+local KillConfirmed  = Combat:WaitForChild("KillConfirmed")
+local SpendConfirmed = ManaRE:WaitForChild("SpendConfirmed")
+
+-- Simple per-player stat store (server authority). Replace with your real system later.
+local stats = {}  -- [player] = {health={cur,max}, mana={cur,max}}
+local defaults = {healthMax = 100, manaMax = 100}
+
+local function get(p)
+	stats[p] = stats[p] or {
+		health = {cur = defaults.healthMax, max = defaults.healthMax},
+		mana   = {cur = defaults.manaMax,   max = defaults.manaMax},
+	}
+	return stats[p]
+end
+
+-- Example: spend/damage still use % of MAX if you prefer
+-- local onePercentMana = math.floor(get(p).mana.max * 0.01)
+
+
+Players.PlayerAdded:Connect(function(p) get(p) end)
+Players.PlayerRemoving:Connect(function(p) stats[p] = nil end)
+
+-- === Example hooks you’ll call from BoomBall / combat code ===
+
+-- Call this when Player p spends mana (e.g., throws BoomBall)
+local function confirmManaSpend(p, amount)
+	local s = get(p)
+	s.mana.cur = math.max(0, s.mana.cur - amount)
+	SpendConfirmed:FireClient(p, amount, s.mana.cur, s.mana.max)
+end
+
+-- Call this when victim takes damage
+local function confirmDamage(victim, dmg)
+	local s = get(victim)
+	s.health.cur = math.max(0, s.health.cur - dmg)
+	PlayerDamaged:FireClient(victim, dmg, s.health.cur, s.health.max)
+end
+
+-- Call this on kill
+local function confirmKill(killer, victim)
+	KillConfirmed:FireClient(killer, killer.UserId, victim.UserId)
+end
+
+--[[ EXAMPLE TEST COMMANDS (run once from server after 3s)
+task.delay(3, function()
+    for _,p in ipairs(Players:GetPlayers()) do
+        confirmManaSpend(p, math.floor(get(p).mana.max * 0.01)) -- 1% spend
+        confirmDamage(p,    math.floor(get(p).health.max * 0.01)) -- 1% damage
+    end
+end)
+]]
