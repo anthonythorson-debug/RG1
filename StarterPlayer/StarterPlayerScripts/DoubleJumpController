@@ -1,0 +1,243 @@
+-- DoubleJumpController (LocalScript)
+-- Fixes same-frame double firing by arming double jump ONLY after Freefall.
+-- Adds stamina + cooldown; uses Torus MeshPart if available for shockwave.
+
+-- Services
+local Players           = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris            = game:GetService("Debris")
+
+-- Config
+local ConfigFolder    = ReplicatedStorage:WaitForChild("Config")
+local MovementConfig  = require(ConfigFolder:WaitForChild("MovementConfig"))
+if not MovementConfig.EnableDoubleJump then return end
+
+-- Optional stamina client (interface: TryConsume(number) -> boolean)
+-- Optional stamina client (interface: TryConsume(number) -> boolean)
+local StaminaClient = nil
+do
+	local shared = ReplicatedStorage:FindFirstChild("Shared")
+	if shared then
+		local mod = shared:FindFirstChild("StaminaClient")
+		if mod and mod:IsA("ModuleScript") then
+			local ok, res = pcall(require, mod)
+			if ok and type(res) == "table" and type(res.TryConsume) == "function" then
+				StaminaClient = res
+			else
+				warn("[DoubleJump] StaminaClient require failed or missing TryConsume; continuing without stamina.")
+			end
+		end
+	end
+end
+
+
+-- Player bits
+local player   = Players.LocalPlayer
+local char     = player.Character or player.CharacterAdded:Wait()
+local humanoid = char:WaitForChild("Humanoid")
+local root     = char:WaitForChild("HumanoidRootPart")
+local animator = humanoid:WaitForChild("Animator")
+
+-- ===== Animations via MovementConfig.ANIMS =====
+local firstJumpTrack  : AnimationTrack? = nil
+local secondJumpTrack : AnimationTrack? = nil
+
+local function loadTrackFromAnimIdString(idStr: string?): AnimationTrack?
+	if not idStr or idStr == "" then return nil end
+	local anim = Instance.new("Animation")
+	if string.find(idStr, "rbxassetid://") then
+		anim.AnimationId = idStr
+	else
+		anim.AnimationId = "rbxassetid://" .. tostring(idStr)
+	end
+	return animator:LoadAnimation(anim)
+end
+
+local function tryLoadJumpAnims()
+	local anims = MovementConfig.ANIMS or {}
+	firstJumpTrack  = loadTrackFromAnimIdString(anims.JUMP1)
+	secondJumpTrack = loadTrackFromAnimIdString(anims.JUMP2)
+end
+tryLoadJumpAnims()
+
+-- ===== State =====
+local grounded            = true
+local armedDouble         = false   -- becomes true only AFTER first jump leaves ground (Freefall)
+local usedDouble          = false
+local lastDoubleTime      = -1e9
+local cd                  = MovementConfig.DoubleJumpCooldown or 0.18
+local staminaCost         = MovementConfig.DoubleJumpStaminaCost or 0
+local armAtTime = -1e9  -- when second jump becomes eligible
+
+-- ===== Helpers =====
+local function isStateExcluded(state: Enum.HumanoidStateType): boolean
+	return state == Enum.HumanoidStateType.Swimming
+		or state == Enum.HumanoidStateType.Seated
+		or state == Enum.HumanoidStateType.Climbing
+end
+
+local function playSafely(track: AnimationTrack?)
+	if track then track:Play(0.08, 1.0, 1.0) end
+end
+
+-- Torus source (optional)
+local TorusSource: MeshPart? = nil
+do
+	local fxFolder = ReplicatedStorage:FindFirstChild("FX")
+	if fxFolder then
+		local m = fxFolder:FindFirstChild("TorusShockwave")
+		if m and m:IsA("MeshPart") then
+			TorusSource = m
+		end
+	end
+end
+
+local function spawnShockwave()
+	local initial = MovementConfig.ShockwaveInitialSize or 6
+	local final   = MovementConfig.ShockwaveFinalSize   or 28
+	local thick   = MovementConfig.ShockwaveThickness   or 0.25
+	local dur     = MovementConfig.ShockwaveDuration    or 0.35
+	local yoff    = MovementConfig.ShockwaveYOffset     or 2.25
+
+	-- If a torus MeshPart is provided, clone & tween its size
+	if TorusSource then
+		local ring = TorusSource:Clone()
+		ring.Anchored = true
+		ring.CanCollide = false
+		ring.CastShadow = false
+		ring.Transparency = 0.2
+		ring.CFrame = CFrame.new(root.Position - Vector3.new(0, yoff, 0)) * CFrame.Angles(math.rad(90), 0, 0)
+		ring.Parent = workspace
+
+		-- We’ll scale uniformly using Size (assumes torus modeled roughly as X/Z diameter)
+		local startSize = Vector3.new(initial, initial, initial)
+		local endSize   = Vector3.new(final,   final,   final)
+		ring.Size = startSize
+
+		local tween = TweenService:Create(ring, TweenInfo.new(dur, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			Size = endSize,
+			Transparency = 1
+		})
+		tween:Play()
+		tween.Completed:Connect(function() ring:Destroy() end)
+		Debris:AddItem(ring, dur + 0.1)
+		return
+	end
+
+	-- Fallback: thin cylinder disc “ring”
+	local p = Instance.new("Part")
+	p.Name = "ShockwaveRing"
+	p.Anchored = true
+	p.CanCollide = false
+	p.CastShadow = false
+	p.Material = Enum.Material.Neon
+	p.Transparency = 0.25
+	p.Color = Color3.new(1,1,1)
+	p.Size = Vector3.new(initial, thick, initial)
+	p.CFrame = CFrame.new(root.Position - Vector3.new(0, yoff, 0)) * CFrame.Angles(math.rad(90), 0, 0)
+	p.Parent = workspace
+
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.Cylinder
+	mesh.Parent = p
+
+	local tween = TweenService:Create(p, TweenInfo.new(dur, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = Vector3.new(final, thick, final),
+		Transparency = 1
+	})
+	tween:Play()
+	tween.Completed:Connect(function() p:Destroy() end)
+	Debris:AddItem(p, dur + 0.1)
+end
+
+local function doSecondJump()
+	-- cooldown
+	if (time() - lastDoubleTime) < cd then return end
+
+	-- stamina (optional)
+	if StaminaClient and staminaCost > 0 then
+		if not StaminaClient.TryConsume(staminaCost) then
+			return -- not enough stamina
+		end
+	end
+
+	usedDouble = true
+	armedDouble = false
+	lastDoubleTime = time()
+
+	-- Upward impulse while preserving horizontal velocity
+	local jumpPower = MovementConfig.JumpPower or 50
+	local mult      = MovementConfig.DoubleJumpMultiplier or 0.75
+	local boost     = jumpPower * mult
+
+	local mass = root.AssemblyMass
+	root:ApplyImpulse(Vector3.new(0, mass * boost, 0))
+
+	-- Enter jump state & play second-jump anim
+	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	playSafely(secondJumpTrack)
+
+	-- VFX
+	spawnShockwave()
+end
+
+-- Input logic:
+-- - On ground press: start first jump, DO NOT arm double yet.
+-- - On Freefall (after takeoff): arm double.
+-- - Mid-air press while armed triggers second.
+UserInputService.JumpRequest:Connect(function()
+	if grounded then
+		-- First jump: Roblox handles the vertical pop automatically on JumpRequest.
+		-- Play first-jump anim explicitly if provided.
+		playSafely(firstJumpTrack)
+		-- Do NOT arm double here to avoid same-frame double firing.
+	else
+		-- Mid-air: only allow if armed, not used yet, and not in excluded states
+		if armedDouble and not usedDouble and not isStateExcluded(humanoid:GetState()) then
+			if time() >= armAtTime then              -- << new
+				doSecondJump()
+			end
+		end
+	end
+end)
+
+-- State machine for arming, landing reset, exclusions
+humanoid.StateChanged:Connect(function(_, new)
+	if new == Enum.HumanoidStateType.Landed
+		or new == Enum.HumanoidStateType.Running
+		or new == Enum.HumanoidStateType.RunningNoPhysics then
+		grounded = true
+		armedDouble = false
+		usedDouble = false
+
+	elseif new == Enum.HumanoidStateType.Jumping then
+		-- still considered airborne, but we only arm once we truly enter Freefall
+
+	elseif new == Enum.HumanoidStateType.Freefall then
+		-- Left the ground after first jump -> arm the double
+		if not isStateExcluded(new) then
+			grounded = false
+			armedDouble = true
+			armAtTime = time() + (MovementConfig.DoubleJumpArmDelay or 0.10)  -- << new
+		end
+
+	elseif isStateExcluded(new) then
+		grounded = false
+		armedDouble = false
+		usedDouble = true
+	end
+end)
+
+-- Respawn safety
+player.CharacterAdded:Connect(function(c)
+	char = c
+	humanoid = char:WaitForChild("Humanoid")
+	root = char:WaitForChild("HumanoidRootPart")
+	animator = humanoid:WaitForChild("Animator")
+	tryLoadJumpAnims()
+	grounded = true
+	armedDouble = false
+	usedDouble = false
+end)
