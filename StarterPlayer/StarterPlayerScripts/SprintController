@@ -1,0 +1,322 @@
+-- SprintController (LocalScript)
+
+-- Services
+local Players            = game:GetService("Players")
+local UserInputService   = game:GetService("UserInputService")
+local TweenService       = game:GetService("TweenService")
+local RunService         = game:GetService("RunService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local signals      = ReplicatedStorage:WaitForChild("Signals")
+local DashStarted  = signals:WaitForChild("DashStarted")
+local DashEnded    = signals:WaitForChild("DashEnded")
+
+
+-- Config
+local MovementConfig     = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("MovementConfig"))
+
+-- Player bits
+local player             = Players.LocalPlayer
+local char               = player.Character or player.CharacterAdded:Wait()
+local humanoid           = char:WaitForChild("Humanoid")
+local animator           = humanoid:WaitForChild("Animator")
+
+-- Camera
+local cam                = workspace.CurrentCamera
+
+-- State
+local isSprinting        = false
+local sprintHeld         = false
+local sprintToggled      = false
+local sprintTrack        = nil
+local fovTween           = nil
+local dashLock 			 = false  -- prevent sprint during dash, but remember the user's intent
+
+
+-- Helpers
+
+local lastInputType = game:GetService("UserInputService"):GetLastInputType()
+UserInputService.LastInputTypeChanged:Connect(function(t)
+	lastInputType = t
+end)
+
+local function usingGamepad()
+	return lastInputType == Enum.UserInputType.Gamepad1
+		or lastInputType == Enum.UserInputType.Gamepad2
+		or lastInputType == Enum.UserInputType.Gamepad3
+		or lastInputType == Enum.UserInputType.Gamepad4
+end
+
+local function currentSprintMode()
+	if usingGamepad() then
+		return MovementConfig.Input.Gamepad.Mode
+	else
+		return MovementConfig.Input.Keyboard.Mode
+	end
+end
+
+
+local function getCurrentBaseSpeed()
+	return MovementConfig.WalkSpeed * (MovementConfig.SpeedMultiplier or 1.0)
+end
+
+local function getCurrentSprintSpeed()
+	return MovementConfig.SprintSpeed * (MovementConfig.SpeedMultiplier or 1.0)
+end
+
+local function getBaseFOV()
+	return (MovementConfig.BaseFOV or 70) + (MovementConfig.FOVAdditive or 0.0)
+end
+
+local function getSprintFOV()
+	return (MovementConfig.SprintFOV or 85) + (MovementConfig.FOVAdditive or 0.0)
+end
+
+local function tweenFOV(targetFov)
+	if not cam then return end
+	if fovTween then
+		fovTween:Cancel()
+	end
+	fovTween = TweenService:Create(
+		cam,
+		TweenInfo.new(MovementConfig.FOVTweenTime, MovementConfig.FOVTweenStyle, MovementConfig.FOVTweenDirection),
+		{ FieldOfView = targetFov }
+	)
+	fovTween:Play()
+end
+
+local function loadSprintAnimation()
+	-- 1) Prefer explicit ID in MovementConfig.ANIMS.SPRINT
+	if MovementConfig.ANIMS and MovementConfig.ANIMS.SPRINT and MovementConfig.ANIMS.SPRINT ~= "" then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = MovementConfig.ANIMS.SPRINT
+		local track = animator:LoadAnimation(anim)
+		if not track then warn("[SprintController] Failed to load sprint anim from ANIMS.SPRINT") end
+		return track
+	end
+
+	-- 2) Fallback: ReplicatedStorage/Animations/Sprint
+	local animsFolder = ReplicatedStorage:FindFirstChild("Animations")
+	if animsFolder then
+		local sprintAnim = animsFolder:FindFirstChild("Sprint")
+		if sprintAnim and sprintAnim:IsA("Animation") and sprintAnim.AnimationId ~= "" then
+			local track = animator:LoadAnimation(sprintAnim)
+			if not track then warn("[SprintController] Failed to load sprint anim from ReplicatedStorage.Animations.Sprint") end
+			return track
+		end
+	end
+
+	warn("[SprintController] No sprint animation found. Set MovementConfig.ANIMS.SPRINT or add ReplicatedStorage/Animations/Sprint")
+	return nil
+end
+
+
+local function playSprintAnim()
+	if sprintTrack and sprintTrack.IsPlaying then return end
+	if not sprintTrack then
+		sprintTrack = loadSprintAnimation()
+	end
+	if sprintTrack then
+		sprintTrack:Play(MovementConfig.FadeTime, MovementConfig.BlendWeight, 1.0)
+	end
+end
+
+local function stopSprintAnim()
+	if sprintTrack and sprintTrack.IsPlaying then
+		sprintTrack:Stop(MovementConfig.FadeTime)
+	end
+end
+
+local function applyPhysicsTuning()
+	workspace.Gravity = MovementConfig.Gravity
+	if MovementConfig.UseJumpHeight then
+		humanoid.UseJumpPower = false
+		humanoid.JumpHeight   = MovementConfig.JumpHeight
+	else
+		humanoid.UseJumpPower = true
+		humanoid.JumpPower    = MovementConfig.JumpPower
+	end
+end
+
+local function setSpeedWalk()
+	humanoid.WalkSpeed = getCurrentBaseSpeed()
+end
+
+local function setSpeedSprint()
+	humanoid.WalkSpeed = getCurrentSprintSpeed()
+end
+
+local function canSprintNow()
+	-- Respect states that should cancel sprint
+	if MovementConfig.RespectStates and next(MovementConfig.RespectStates) then
+		local state = humanoid:GetState()
+		if MovementConfig.RespectStates[state] then
+			return false
+		end
+	end
+
+	-- Require movement input?
+	if MovementConfig.SprintRequiresMovement then
+		if humanoid.MoveDirection.Magnitude <= 0.01 then
+			return false
+		end
+	end
+
+	-- Require grounded?
+	if MovementConfig.StopSprintWhenAirborne then
+		local state = humanoid:GetState()
+		-- Consider Running/Freefall states valid/invalid as you prefer. Here we allow running, disallow freefall.
+		if state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping then
+			return false
+		end
+	end
+	
+	-- Directional gating aligned to camera forward
+	if MovementConfig.Directional and MovementConfig.Directional.ForwardOnly then
+		local move = humanoid.MoveDirection
+		if move.Magnitude <= 0.01 then
+			return false
+		end
+
+		-- Project onto XZ plane
+		local fwd = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+		if fwd.Magnitude > 0 then fwd = fwd.Unit end
+
+		local flatMove = Vector3.new(move.X, 0, move.Z)
+		local dot = 0
+		if flatMove.Magnitude > 0 then
+			dot = flatMove.Unit:Dot(fwd)
+		end
+
+		-- Require some forward component (e.g., W, A+W, D+W)
+		local minDot = MovementConfig.Directional.MinForwardDot or 0.0
+		if dot < minDot then
+			-- dot < 0   => moving backward (block)
+			-- dot ~ 0   => pure strafe left/right (block)
+			return false
+		end
+	end
+
+
+	return true
+end
+
+local function startSprint()
+	if isSprinting then return end
+	if not canSprintNow() then return end
+	isSprinting = true
+	setSpeedSprint()
+	playSprintAnim()
+	tweenFOV(getSprintFOV())
+end
+
+local function stopSprint()
+	if not isSprinting then return end
+	isSprinting = false
+	setSpeedWalk()
+	stopSprintAnim()
+	tweenFOV(getBaseFOV())
+end
+
+DashStarted.Event:Connect(function()
+	dashLock = true
+	-- Cancel sprint animation/speed immediately
+	if isSprinting then
+		stopSprint()
+	end
+end)
+
+DashEnded.Event:Connect(function()
+	dashLock = false
+	-- If the player still wants to sprint, resume it
+	local mode = currentSprintMode()
+	local wants = (mode == "Toggle" and sprintToggled) or (mode == "Hold" and sprintHeld)
+	if wants and canSprintNow() then
+		startSprint()
+	end
+end)
+
+
+-- Listen for character respawn (rebinds + physics)
+player.CharacterAdded:Connect(function(c)
+	char = c
+	humanoid = char:WaitForChild("Humanoid")
+	animator = humanoid:WaitForChild("Animator")
+	sprintTrack = nil
+	applyPhysicsTuning()
+	setSpeedWalk()
+	cam = workspace.CurrentCamera
+	cam.FieldOfView = getBaseFOV()
+end)
+
+-- Initial setup
+applyPhysicsTuning()
+setSpeedWalk()
+cam.FieldOfView = getBaseFOV()
+
+-- Input handling
+local function isKeyboardSprintKey(keyCode)
+	return keyCode == MovementConfig.Input.Keyboard.SprintKey
+		or keyCode == MovementConfig.Input.Keyboard.AltSprintKey
+end
+
+local function isGamepadSprintKey(keyCode)
+	return keyCode == MovementConfig.Input.Gamepad.SprintKey
+end
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+
+	-- Keyboard
+	if input.UserInputType == Enum.UserInputType.Keyboard and isKeyboardSprintKey(input.KeyCode) then
+		if currentSprintMode() == "Toggle" then
+			sprintToggled = not sprintToggled
+			if sprintToggled then startSprint() else stopSprint() end
+		else
+			sprintHeld = true
+			startSprint()
+		end
+		return
+	end
+
+	-- Gamepad
+	if input.UserInputType.Name:match("^Gamepad") and isGamepadSprintKey(input.KeyCode) then
+		-- Controller is always Toggle per config
+		sprintToggled = not sprintToggled
+		if sprintToggled then startSprint() else stopSprint() end
+		return
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gp)
+	if gp then return end
+
+	-- Only matters for Keyboard Hold mode
+	if input.UserInputType == Enum.UserInputType.Keyboard and isKeyboardSprintKey(input.KeyCode) then
+		if currentSprintMode() == "Hold" then
+			sprintHeld = false
+			stopSprint()
+		end
+	end
+end)
+
+-- Continuously check movement to auto-start/stop when needed (e.g., you press Shift first, then start moving)
+RunService.Heartbeat:Connect(function()
+	-- If holding (or toggled), maintain sprint only if allowed
+	local mode = currentSprintMode()
+	local wantsSprint =
+		(mode == "Toggle" and sprintToggled)
+		or (mode == "Hold" and sprintHeld)
+
+	if wantsSprint then
+		if canSprintNow() then
+			if not isSprinting then startSprint() end
+		else
+			if isSprinting then stopSprint() end
+		end
+	end
+
+	-- Stop sprint when movement stops (optional)
+	if isSprinting and MovementConfig.StopSprintOnZeroMove and humanoid.MoveDirection.Magnitude <= 0.01 then
+		stopSprint()
+	end
+end)
