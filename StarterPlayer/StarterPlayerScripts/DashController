@@ -1,0 +1,373 @@
+-- DashController (LocalScript)
+
+-- Services
+local Players           = game:GetService("Players")
+local UIS               = game:GetService("UserInputService")
+local TS                = game:GetService("TweenService")
+local RS                = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local signals      = ReplicatedStorage:WaitForChild("Signals")
+local DashStarted  = signals:WaitForChild("DashStarted")
+local DashEnded    = signals:WaitForChild("DashEnded")
+
+
+-- Config
+local MovementConfig    = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("MovementConfig"))
+local DashConfig        = MovementConfig.Dash
+local VFXConfig         = MovementConfig.DashVFX
+
+-- Player / character
+local player            = Players.LocalPlayer
+local character         = player.Character or player.CharacterAdded:Wait()
+local humanoid          = character:WaitForChild("Humanoid")
+local animator          = humanoid:WaitForChild("Animator")
+local hrp               = character:WaitForChild("HumanoidRootPart")
+local camera            = workspace.CurrentCamera
+
+-- State
+local isDashing         = false
+local nextReady         = { FORWARD = 0, LEFT = 0, RIGHT = 0, BACK = 0 }  -- unix timestamps
+local lastInputType     = UIS:GetLastInputType()
+
+-- Anim tracks cache
+local dashTracks        = { FORWARD=nil, LEFT=nil, RIGHT=nil, BACK=nil }
+
+-- Helpers
+UIS.LastInputTypeChanged:Connect(function(t) lastInputType = t end)
+local function now() return os.clock() end
+
+local function projXZ(v) return Vector3.new(v.X, 0, v.Z) end
+
+local function camBasis()
+	local fwd = projXZ(camera.CFrame.LookVector)
+	local right = projXZ(camera.CFrame.RightVector)
+	if fwd.Magnitude > 0 then fwd = fwd.Unit end
+	if right.Magnitude > 0 then right = right.Unit end
+	return fwd, right
+end
+
+local function getIntentWorldVector()
+	local fwd, right = camBasis()
+
+	-- Keyboard: build intent from held keys (super reliable)
+	local usingKeyboard = (lastInputType == Enum.UserInputType.Keyboard)
+
+	if usingKeyboard then
+		local x = 0
+		local z = 0
+		if UIS:IsKeyDown(Enum.KeyCode.A) then x -= 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.D) then x += 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.W) then z += 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.S) then z -= 1 end
+
+		local v = (right * x) + (fwd * z)
+		return v
+	end
+
+	-- Gamepad: read Thumbstick1 directly
+	if lastInputType.Name:match("^Gamepad") then
+		local state = UIS:GetGamepadState(Enum.UserInputType.Gamepad1)
+		for _, inp in ipairs(state) do
+			if inp.KeyCode == Enum.KeyCode.Thumbstick1 then
+				local pos = inp.Position -- Vector2
+				-- deadzone
+				if pos.Magnitude < 0.20 then
+					return Vector3.zero
+				end
+
+				-- pos.X = right, pos.Y = up on stick (forward is +Y)
+				local x = pos.X
+				local z = pos.Y
+
+				local v = (right * x) + (fwd * z)
+				return v
+			end
+		end
+	end
+
+	-- Fallback
+	return humanoid.MoveDirection
+end
+
+
+local function classifyDashDir(worldVec)
+	--[[ Return "FORWARD"|"BACK"|"LEFT"|"RIGHT" or nil if neutral
+	local mv = projXZ(moveVec)
+	if mv.Magnitude <= 0.05 then return nil end
+
+	local fwd, right = camBasis()
+	local dF = mv.Unit:Dot(fwd)
+	local dR = mv.Unit:Dot(right)
+	local T  = DashConfig.DirectionDotThreshold or 0.5
+
+	-- prioritize forward if W+others pressed
+	if dF >= T then return "FORWARD" end
+	if dF <= -T then return "BACK" end
+	if dR >= T then return "RIGHT" end
+	if dR <= -T then return "LEFT" end
+
+	-- If between, prefer forward if weakly forward
+	if dF > 0 then return "FORWARD" end
+	return nil
+	]]
+		local v = projXZ(worldVec)
+		if v.Magnitude <= 0.05 then return nil end
+
+		local fwd, right = camBasis()
+		local unit = v.Unit
+
+		local mx = unit:Dot(right) -- +right / -left
+		local mz = unit:Dot(fwd)   -- +forward / -back
+		local T  = MovementConfig.Dash.DirectionDotThreshold or 0.5
+
+		if mz >= T then return "FORWARD" end
+		if mz <= -T then return "BACK" end
+		if mx >= T then return "RIGHT" end
+		if mx <= -T then return "LEFT" end
+
+		-- if it's diagonal but not strong enough, prefer the larger axis
+		if math.abs(mz) >= math.abs(mx) then
+			return (mz >= 0) and "FORWARD" or "BACK"
+		else
+			return (mx >= 0) and "RIGHT" or "LEFT"
+		end
+
+end
+
+local function loadDashTrack(which)
+	if dashTracks[which] ~= nil then return dashTracks[which] end
+	local id = MovementConfig.ANIMS and MovementConfig.ANIMS.DASH and MovementConfig.ANIMS.DASH[which]
+	if id and id ~= "" then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = id
+		dashTracks[which] = animator:LoadAnimation(anim)
+	else
+		dashTracks[which] = false -- sentinel: no track for this direction
+	end
+	return dashTracks[which]
+end
+
+local function playDashAnim(which)
+	local t = loadDashTrack(which)
+	if t and t ~= false then
+		t:Play(MovementConfig.FadeTime or 0.1, MovementConfig.BlendWeight or 1.0, 1.0)
+	end
+end
+
+local fovTween
+local function dashFOVUp()
+	if not camera then return end
+	if fovTween then fovTween:Cancel() end
+	fovTween = TS:Create(camera, TweenInfo.new(DashConfig.FOV.UpTime, Enum.EasingStyle.Linear), {FieldOfView = (DashConfig.FOV.Target or 95)})
+	fovTween:Play()
+end
+
+local function dashFOVDown()
+	if not camera then return end
+	if fovTween then fovTween:Cancel() end
+	fovTween = TS:Create(camera, TweenInfo.new(DashConfig.FOV.DownTime, Enum.EasingStyle.Linear), {FieldOfView = (MovementConfig.BaseFOV or 70) + (MovementConfig.FOVAdditive or 0)})
+	fovTween:Play()
+end
+
+-- Multi-line speed lines (ring around character), random black/white per line
+local function spawnSpeedLinesRing(dirWorld, lifetime)
+	local cfg = VFXConfig
+	if not cfg or not cfg.Enabled then
+		return function() end
+	end
+	dirWorld = dirWorld.Magnitude > 0 and dirWorld.Unit or Vector3.new(0,0,-1)
+
+	local rng = Random.new()
+
+	-- Build an orientation basis around dash direction
+	local up = Vector3.new(0,1,0)
+	local right = dirWorld:Cross(up)
+	if right.Magnitude < 0.001 then
+		-- Edge case: if dir ≈ up, pick a different up
+		up = Vector3.new(0,0,1)
+		right = dirWorld:Cross(up)
+	end
+	right = right.Unit
+	local trueUp = right:Cross(dirWorld).Unit
+
+	-- How many lines this dash
+	local n = math.max(2, cfg.LineCount + rng:NextInteger(-cfg.LineCountJitter, cfg.LineCountJitter))
+
+	-- Store created instances to clean up
+	local created = {}
+
+	-- Helper to make a single trail with attachments
+	local function makeOne(angle, elev)
+		-- position the anchor point around an elliptical ring (outline vibe)
+		local radial = (right * math.cos(angle) + trueUp * math.sin(angle))
+		local offsetAround = radial * cfg.Radius + trueUp * elev
+
+		-- attachments
+		local a0 = Instance.new("Attachment")
+		local a1 = Instance.new("Attachment")
+		a0.Name, a1.Name = "DashTrailA0", "DashTrailA1"
+		a0.Parent = hrp
+		a1.Parent = hrp
+
+		-- place a0 around the ring; a1 is pulled back along dash direction
+		a0.Position = offsetAround
+		a1.Position = offsetAround - (dirWorld * cfg.BackOffset)
+
+		local trail = Instance.new("Trail")
+		trail.Attachment0 = a0
+		trail.Attachment1 = a1
+		trail.FaceCamera = true
+		trail.LightInfluence = 0
+		trail.Transparency = cfg.Transparency
+		trail.Lifetime = cfg.Lifetime or 0.2
+		trail.MinLength = 0.05
+		trail.WidthScale = NumberSequence.new{
+			NumberSequenceKeypoint.new(0, cfg.WidthMax or 0.14),
+			NumberSequenceKeypoint.new(1, cfg.WidthMin or 0.06)
+		}
+
+		-- Random black or white
+		local isWhite = (rng:NextNumber() < (cfg.WhiteChance or 0.5))
+		if isWhite then
+			trail.Color = ColorSequence.new(Color3.new(1,1,1))
+		else
+			trail.Color = ColorSequence.new(Color3.new(0,0,0))
+		end
+
+		trail.Parent = hrp
+		table.insert(created, trail)
+		table.insert(created, a0)
+		table.insert(created, a1)
+	end
+
+	-- Distribute lines with some randomness
+	for i = 1, n do
+		local t = (i / n) * 2 * math.pi
+		local jitterAngle = (rng:NextNumber() - 0.5) * (math.pi / 6) -- +/- 30° randomness
+		local angle = t + jitterAngle
+
+		local elev = (rng:NextNumber() * 2 - 1) * (cfg.VerticalSpread or 0) -- random vertical offset
+		makeOne(angle, elev)
+	end
+
+	-- cleanup function (called after dash wraps up)
+	return function()
+		-- wait for trails to fade out
+		task.delay((lifetime or 0) + (cfg.Lifetime or 0.2), function()
+			for _,inst in ipairs(created) do
+				if inst and inst.Parent then inst:Destroy() end
+			end
+		end)
+	end
+end
+
+
+-- Core dash routine
+local function doDash(which)
+	if isDashing then return end
+
+	local cfg = (which == "FORWARD") and DashConfig.Forward
+		or (which == "BACK") and DashConfig.Back
+		or DashConfig.Side
+
+	-- cooldown gate
+	local tnow = now()
+	if tnow < (nextReady[which] or 0) then return end
+
+	DashStarted:Fire()
+	isDashing = true
+
+	-- animation + FOV
+	playDashAnim(which)
+	dashFOVUp()
+
+	-- choose initial direction
+	local fwd, right = camBasis()
+	local dir
+	if which == "FORWARD" then dir = fwd
+	elseif which == "BACK" then dir = -fwd
+	elseif which == "LEFT" then dir = -right
+	elseif which == "RIGHT" then dir = right
+	else dir = fwd end
+
+	-- VFX
+	local cleanupTrail = spawnSpeedLinesRing(dir, cfg.Duration)
+
+	-- movement burst (uses velocity override)
+	local endTime = tnow + cfg.Duration
+	local steer = (cfg.MidDashSteer == true)
+
+	-- Optional: temporarily reduce friction effects by zeroing controller input
+	-- (not strictly needed; we just override velocity each frame)
+	local conn
+	conn = RS.Heartbeat:Connect(function()
+		local nowt = now()
+		if nowt >= endTime then
+			if conn then conn:Disconnect() end
+			return
+		end
+
+		local dashDir = dir
+		if steer and which == "FORWARD" then
+			-- allow mid-dash steering by camera look
+			dashDir = projXZ(camera.CFrame.LookVector)
+			if dashDir.Magnitude > 0 then dashDir = dashDir.Unit else dashDir = dir end
+		end
+
+		local v = hrp.AssemblyLinearVelocity
+		hrp.AssemblyLinearVelocity = Vector3.new(dashDir.X * cfg.Speed, v.Y, dashDir.Z * cfg.Speed)
+	end)
+
+	-- wrap-up after duration
+	task.delay(cfg.Duration, function()
+		isDashing = false
+		nextReady[which] = now() + (cfg.Cooldown or 3)
+		dashFOVDown()
+		if cleanupTrail then cleanupTrail() end
+		DashEnded:Fire()
+	end)
+end
+
+-- Input → attempt dash
+local function tryDashFromInput()
+	--[[if isDashing then return end
+	local mv = getMoveVector()
+	local which = classifyDashDir(mv)
+	if not which then
+		-- No strong direction: default to FORWARD
+		which = "FORWARD"
+	end
+
+	-- honor per-direction cooldown
+	if now() < (nextReady[which] or 0) then return end
+	doDash(which)
+	]]
+	if isDashing then return end
+
+	local intent = getIntentWorldVector()
+	local which = classifyDashDir(intent) or "FORWARD"
+
+	if now() < (nextReady[which] or 0) then return end
+	doDash(which)
+end
+
+-- Bind keys/buttons
+UIS.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == DashConfig.Input.KeyboardKey then
+		tryDashFromInput()
+	end
+	if input.UserInputType.Name:match("^Gamepad") and input.KeyCode == DashConfig.Input.GamepadKey then
+		tryDashFromInput()
+	end
+end)
+
+-- Rebind on respawn
+player.CharacterAdded:Connect(function(c)
+	character = c
+	humanoid = character:WaitForChild("Humanoid")
+	animator = humanoid:WaitForChild("Animator")
+	hrp     = character:WaitForChild("HumanoidRootPart")
+	dashTracks = { FORWARD=nil, LEFT=nil, RIGHT=nil, BACK=nil }
+	isDashing  = false
+end)
