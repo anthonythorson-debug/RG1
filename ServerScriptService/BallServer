@@ -1,0 +1,183 @@
+-- BallServer.lua
+local RS      = game:GetService("ReplicatedStorage")
+local Debris  = game:GetService("Debris")
+local Players = game:GetService("Players")
+
+local function wfc(parent, name, t)
+	return parent:FindFirstChild(name) or parent:WaitForChild(name, t or 5)
+end
+
+-- Remotes / Config
+local remoteFolder = wfc(RS, "RemoteEvents", 5)
+if not remoteFolder then warn("[BoomBall][Server] Missing ReplicatedStorage/RemoteEvents"); return end
+local ThrowEvent = wfc(remoteFolder, "ThrowBall", 5)
+if not ThrowEvent then warn("[BoomBall][Server] Missing ThrowBall RemoteEvent"); return end
+local CombatFolder = wfc(remoteFolder, "Combat", 5)
+local ManaFolder   = wfc(remoteFolder, "Mana", 5)
+
+local PlayerDamaged  = wfc(CombatFolder, "PlayerDamaged", 5)
+local SpendConfirmed = wfc(ManaFolder, "SpendConfirmed", 5)
+
+local sharedFolder = wfc(RS, "Shared", 5)
+if not sharedFolder then warn("[BoomBall][Server] Missing ReplicatedStorage/Shared"); return end
+local ok, Config = pcall(function() return require(wfc(sharedFolder, "BallConfig", 5)) end)
+if not ok then warn("[BoomBall][Server] Could not require BallConfig:", Config) return end
+
+local CombatFolder = remoteFolder:WaitForChild("Combat")
+local ManaFolder = remoteFolder:WaitForChild("Mana")
+
+local PlayerDamaged = CombatFolder:WaitForChild("PlayerDamaged")
+local SpendConfirmed = ManaFolder:WaitForChild("SpendConfirmed")
+
+-- ===== Destructible notify (args, not a table) =====
+local function notifyDestructibles(origin: Vector3, radius: number)
+	local ev = RS:FindFirstChild("ExplosionEvent")
+	if ev and ev:IsA("BindableEvent") then
+		-- origin(Vector3), radius(number), isTerrain=false (so handler affects models)
+		ev:Fire(origin, radius, false)
+	else
+		warn("[BoomBall][Server] ExplosionEvent not found or not a BindableEvent")
+	end
+end
+
+-- ===== Projectile creation =====
+local function createBall()
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Ball
+	p.Size = Vector3.new(Config.BALL_DIAMETER, Config.BALL_DIAMETER, Config.BALL_DIAMETER)
+	p.Color = Config.BALL_COLOR
+	p.Material = Config.BALL_MATERIAL
+	p.Anchored = false
+	p.CanCollide = Config.CAN_COLLIDE
+	p.Name = "BoomBall"
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	return p
+end
+
+-- ===== Detonation =====
+local function detonate(position: Vector3, ownerUserId: number?)
+	-- 1) Notify DestructibleHandler (models)
+	notifyDestructibles(position, Config.EXPLOSION_RADIUS)
+
+	-- 2) Optional SFX
+	if Config.SOUND_ID then
+		local s = Instance.new("Sound")
+		s.SoundId = Config.SOUND_ID
+		s.Volume = 1
+		s.PlayOnRemove = true
+		s.Parent = workspace.Terrain
+		s:Destroy()
+	end
+
+	-- 3) Optional physics push
+	-- 3) Optional physics push + player damage
+	if (Config.EXPLOSION_FORCE or 0) > 0 then
+		local e = Instance.new("Explosion")
+		e.Position = position
+		e.BlastRadius = Config.EXPLOSION_RADIUS
+		e.BlastPressure = Config.EXPLOSION_FORCE
+		e.DestroyJointRadiusPercent = 0
+
+		-- Damage players within the explosion radius
+		e.Hit:Connect(function(part)
+			local char = part:FindFirstAncestorOfClass("Model")
+			if not char then return end
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			if hum then
+				local victim = Players:GetPlayerFromCharacter(char)
+				if victim and victim.UserId ~= ownerUserId then
+					PlayerDamaged:FireClient(victim, 5)
+				end
+			end
+		end)
+
+		e.Parent = workspace
+	end
+
+
+	-- 4) Optional Terrain carving
+	if Config.DESTROY_TERRAIN then
+		local terrain = workspace:FindFirstChildOfClass("Terrain")
+		if terrain then
+			terrain:FillBall(position, Config.EXPLOSION_RADIUS, Enum.Material.Air)
+		end
+	end
+end
+
+-- ===== Collision binding =====
+local function bindHit(ball, ownerUserId)
+	local detonated = false
+	local born = os.clock()
+
+	local function explodeOnce()
+		if detonated then return end
+		detonated = true
+		local pos = ball and ball.Position or Vector3.zero
+		detonate(pos, ownerUserId)
+		if ball and ball.Parent then ball:Destroy() end
+	end
+
+	ball.Touched:Connect(function(hit)
+		if not ball or not ball.Parent then return end
+		-- small grace to avoid insta-self-hit
+		if ownerUserId and os.clock() - born < (Config.SELF_HIT_COOLDOWN or 0) then
+			local plr = Players:GetPlayerByUserId(ownerUserId)
+			if plr and plr.Character and hit:IsDescendantOf(plr.Character) then
+				return
+			end
+		end
+		explodeOnce()
+	end)
+
+	Debris:AddItem(ball, Config.BALL_LIFETIME)
+	task.delay(Config.BALL_LIFETIME, function()
+		if ball and ball.Parent then
+			explodeOnce()
+		end
+	end)
+end
+
+-- ===== Throw handler =====
+-- Accept only direction from client; spawn in front of HRP server-side
+ThrowEvent.OnServerEvent:Connect(function(player, dir)
+	-- Spend 1 mana when throwing BoomBall
+	SpendConfirmed:FireClient(player, 1)
+	
+	
+	if typeof(dir) ~= "Vector3" or dir.Magnitude < 1e-3 then
+		warn("[BoomBall][Server] Bad dir; using HRP.LookVector fallback")
+	end
+
+	local char = player.Character
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	-- Spawn in front of chest
+	local forward = hrp.CFrame.LookVector
+	local UP      = Vector3.new(0, 1, 0)
+	local startOffsetForward = 5
+	local startOffsetUp      = 1.5
+	local startPos = hrp.Position + forward * startOffsetForward + UP * startOffsetUp
+
+	-- Final throw direction
+	local throwDir = (typeof(dir) == "Vector3" and dir.Magnitude >= 1e-3) and dir.Unit or forward
+
+	local ball = createBall()
+	ball.CFrame = CFrame.new(startPos)
+	ball.Parent = workspace
+	ball:SetNetworkOwner(nil) -- valid now that it's in Workspace
+
+	-- Velocity
+	local speed = Config.THROW_SPEED or 120
+	local vel = throwDir * speed
+	if (Config.EXTRA_UPWARD or 0) ~= 0 then
+		vel += Vector3.new(0, Config.EXTRA_UPWARD, 0)
+	end
+	ball.AssemblyLinearVelocity = vel
+
+	bindHit(ball, player.UserId)
+end)
+
+print("[BoomBall][Server] Ready")
