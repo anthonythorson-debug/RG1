@@ -1,0 +1,146 @@
+-- PlayerMenu.client.lua
+-- Placeholder half-screen panel + Inventory toggle + signal to other systems
+
+local Players = game:GetService("Players")
+local CAS = game:GetService("ContextActionService")
+local TweenService = game:GetService("TweenService")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+
+-- Ensure shared toggle signal exists
+local invSignal = RS:FindFirstChild("InventoryToggled")
+if not invSignal then
+	invSignal = Instance.new("BindableEvent")
+	invSignal.Name = "InventoryToggled"
+	invSignal.Parent = RS
+end
+
+local player = Players.LocalPlayer
+local gui = Instance.new("ScreenGui")
+gui.Name = "PlayerMenu"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = player:WaitForChild("PlayerGui")
+
+-- Root panel (right half)
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.Size = UDim2.fromScale(0.5, 1)
+panel.AnchorPoint = Vector2.new(1, 0)
+panel.Position = UDim2.fromScale(1, 0)
+panel.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+panel.BackgroundTransparency = 0.2
+panel.BorderSizePixel = 0
+panel.Visible = false
+panel.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 16)
+corner.Parent = panel
+
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 48)
+header.BackgroundTransparency = 0.3
+header.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+header.BorderSizePixel = 0
+header.Parent = panel
+
+local tabs = Instance.new("Frame")
+tabs.Name = "Tabs"
+tabs.BackgroundTransparency = 1
+tabs.Size = UDim2.new(1, -24, 1, 0)
+tabs.Position = UDim2.new(0, 12, 0, 0)
+tabs.Parent = header
+
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 8)
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.Parent = tabs
+
+local function makeTab(text, order)
+	local b = Instance.new("TextButton")
+	b.Name = text .. "Tab"
+	b.LayoutOrder = order or 1
+	b.Size = UDim2.new(0, 120, 1, -12)
+	b.Position = UDim2.fromOffset(0, 6)
+	b.BackgroundColor3 = Color3.fromRGB(45, 45, 58)
+	b.AutoButtonColor = true
+	b.Text = text
+	b.TextColor3 = Color3.fromRGB(235, 235, 245)
+	b.Font = Enum.Font.Gotham
+	b.TextSize = 18
+	b.Parent = tabs
+
+	local bc = Instance.new("UICorner")
+	bc.CornerRadius = UDim.new(0, 10)
+	bc.Parent = b
+
+	return b
+end
+
+local inventoryTab = makeTab("Inventory", 1)
+local skillsTab    = makeTab("Skills", 2)
+local attrsTab     = makeTab("Attributes", 3)
+
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Size = UDim2.new(1, -24, 1, -48 - 24)
+body.Position = UDim2.new(0, 12, 0, 60)
+body.BackgroundTransparency = 0.5
+body.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+body.BorderSizePixel = 0
+body.Parent = panel
+
+local bodyCorner = Instance.new("UICorner")
+bodyCorner.CornerRadius = UDim.new(0, 12)
+bodyCorner.Parent = body
+
+-- State
+local isOpen = false
+local tweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+
+local function openinventory()
+	if isOpen then return end
+	isOpen = true
+	panel.Visible = true
+	panel.Position = UDim2.fromScale(1.5, 0)
+	TweenService:Create(panel, tweenInfo, { Position = UDim2.fromScale(1, 0) }):Play()
+	-- Update block: opening inventory
+	-- unableCustomshiftlock(); showcursor()
+	invSignal:Fire(true)
+end
+
+local function closeinventory()
+	if not isOpen then return end
+	isOpen = false
+	local tween = TweenService:Create(panel, tweenInfo, { Position = UDim2.fromScale(1.5, 0) })
+	tween:Play()
+	tween.Completed:Connect(function()
+		if not isOpen then
+			panel.Visible = false
+		end
+	end)
+	-- Update block: closing inventory
+	-- enableCustomshiftlock(); hidecursor()
+	invSignal:Fire(false)
+end
+
+local function toggleInventory()
+	if isOpen then
+		closeinventory()
+	else
+		openinventory()
+	end
+end
+
+-- Bind inputs: M + DPadUp
+local ACTION_NAME = "TogglePlayerMenu"
+local function onAction(_, inputState)
+	if inputState ~= Enum.UserInputState.Begin then return end
+	toggleInventory()
+end
+
+CAS:BindAction(ACTION_NAME, onAction, false, Enum.KeyCode.M, Enum.KeyCode.DPadUp)
