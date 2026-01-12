@@ -1,0 +1,373 @@
+--!strict
+-- ServerScriptService.DestructibleModule
+-- Anthony-ready: voxelized destructible with partial blasts + timed regen.
+-- Keeps chunk size constant across differently scaled parts.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local Debris = game:GetService("Debris")
+local PhysicsService = game:GetService("PhysicsService")
+
+export type DestructibleOptions = {
+	ChunkSize: number?,           -- stud size of each cube chunk (default 2)
+	MaxChunks: number?,           -- safety cap total chunks (default 500)
+	Material: Enum.Material?,     -- overrides chunk material (default: source part.Material)
+	RegenerateAfter: number?,     -- seconds (default 60)
+	KeepAnchoredUntilHit: boolean?, -- keep unbroken chunks anchored (true)
+	ChunkElasticity: number?,     -- physics prop
+	ChunkFriction: number?,       -- physics prop
+	ChunkDensity: number?,        -- physics prop
+	CollisionGroup: string?,      -- optional collision group for ejected chunks
+}
+
+type ChunkRecord = {
+	Part: BasePart,
+	GridIndex: Vector3int16,
+	Destroyed: boolean,
+}
+
+type DestructibleState = {
+	Model: Model,
+	ChunkSize: number,
+	Options: DestructibleOptions,
+	Grid: {[string]: ChunkRecord},
+	AliveCount: number,
+	SourceProps: {
+		Color: Color3,
+		Material: Enum.Material,
+		Transparency: number,
+		Reflectance: number,
+	},
+	BoundsCFrame: CFrame,
+	BoundsSize: Vector3,
+	Regenerating: boolean,
+}
+
+local DestructibleModule = {}
+DestructibleModule.__index = DestructibleModule
+
+-- Defaults
+local DEFAULTS: DestructibleOptions = {
+	ChunkSize = 4 :: number,
+	MaxChunks = 500 :: number,
+	RegenerateAfter = 60 :: number,
+	KeepAnchoredUntilHit = true :: boolean,
+	ChunkElasticity = 0 :: number,
+	ChunkFriction = 0.6 :: number,
+	ChunkDensity = 1 :: number,
+}
+
+local function clamp(n: number, lo: number, hi: number): number
+	return math.max(lo, math.min(hi, n))
+end
+
+local function round(n: number): number
+	return math.floor(n + 0.5)
+end
+
+local function key(ix: number, iy: number, iz: number): string
+	return string.format("%d,%d,%d", ix, iy, iz)
+end
+
+local function AABBContainsHumanoid(min: Vector3, max: Vector3): boolean
+	-- Build an invisible probe part for overlap
+	local probe = Instance.new("Part")
+	probe.Name = "_RegenProbe"
+	probe.Anchored = true
+	probe.CanCollide = false
+	probe.CanQuery = true
+	probe.CanTouch = false
+	probe.Transparency = 1
+
+	local size = max - min
+	probe.Size = Vector3.new(math.max(0.2, size.X), math.max(0.2, size.Y), math.max(0.2, size.Z))
+	probe.CFrame = CFrame.new((min + max) * 0.5)
+	probe.Parent = workspace
+
+	-- Collect all character parts to INCLUDE
+	-- Collect all character parts to INCLUDE
+	local whitelist = {} :: {Instance}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		if char then
+			for _, d in ipairs(char:GetDescendants()) do
+				if d:IsA("BasePart") then
+					table.insert(whitelist, d) -- d is fine here; array is {Instance}
+				end
+			end
+		end
+	end
+
+	local params = OverlapParams.new()
+	params.FilterDescendantsInstances = whitelist        -- ✅ types now match
+	params.FilterType = Enum.RaycastFilterType.Include   -- (not Whitelist)
+
+
+	local params = OverlapParams.new()
+	params.FilterDescendantsInstances = whitelist
+	params.FilterType = Enum.RaycastFilterType.Include  -- ✅ Updated API (was .Whitelist)
+	-- params.MaxParts = 0 -- optional: 0 = no limit
+
+	local hits = workspace:GetPartsInPart(probe, params)
+	probe:Destroy()
+
+	for _, part in ipairs(hits) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		if model and model:FindFirstChildOfClass("Humanoid") then
+			return true
+		end
+	end
+	return false
+end
+
+local function makeChunk(size: Vector3, cf: CFrame, src: BasePart, opts: DestructibleOptions): BasePart
+	local p = Instance.new("Part")
+	p.Size = size
+	p.CFrame = cf
+	p.Anchored = true
+	p.CanCollide = true
+	p.CanQuery = true
+	p.CanTouch = true
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Material = opts.Material or src.Material
+	p.Color = src.Color
+	p.Transparency = src.Transparency
+	p.Reflectance = src.Reflectance
+	local density: number = (opts.ChunkDensity or DEFAULTS.ChunkDensity) :: number
+	local friction: number = (opts.ChunkFriction or DEFAULTS.ChunkFriction) :: number
+	local elasticity: number = (opts.ChunkElasticity or DEFAULTS.ChunkElasticity) :: number
+
+	local cpp = PhysicalProperties.new(density, friction, elasticity)
+	p.CustomPhysicalProperties = cpp
+	p.Name = "Chunk"
+	return p
+end
+
+local function gridCounts(boundsSize: Vector3, chunk: number)
+	local nx = math.max(1, round(boundsSize.X / chunk))
+	local ny = math.max(1, round(boundsSize.Y / chunk))
+	local nz = math.max(1, round(boundsSize.Z / chunk))
+	return nx, ny, nz
+end
+
+function DestructibleModule._voxelize(source: BasePart, opts: DestructibleOptions): DestructibleState
+	local options = table.clone(DEFAULTS)
+	for k,v in pairs(opts or {}) do
+		(options :: any)[k] = v
+	end
+
+	local model = Instance.new("Model")
+	model.Name = source.Name .. "_Destructible"
+
+	local cf = source.CFrame
+	local size = source.Size
+	local chunkSize = options.ChunkSize :: number
+
+	local nx, ny, nz = gridCounts(size, chunkSize)
+	local total = nx*ny*nz
+	if total > (options.MaxChunks :: number) then
+		warn(("Destructible '%s' would create %d chunks (> MaxChunks=%d). Raising ChunkSize to reduce count.")
+			:format(source.Name, total, options.MaxChunks :: number))
+		-- lift chunk size until we’re under cap
+		local scale = (total / (options.MaxChunks :: number))^(1/3)
+		chunkSize *= scale + 0.01
+		nx, ny, nz = gridCounts(size, chunkSize)
+		total = nx*ny*nz
+	end
+
+	-- compute actual per-axis step (perfect tiling)
+	local sx = size.X / nx
+	local sy = size.Y / ny
+	local sz = size.Z / nz
+
+	local origin = cf * CFrame.new(-size.X/2 + sx/2, -size.Y/2 + sy/2, -size.Z/2 + sz/2)
+
+	local grid: {[string]: ChunkRecord} = {}
+	local alive = 0
+
+	for ix = 0, nx-1 do
+		for iy = 0, ny-1 do
+			for iz = 0, nz-1 do
+				local cellCF = origin * CFrame.new(ix*sx, iy*sy, iz*sz)
+				local chunkPart = makeChunk(Vector3.new(sx, sy, sz), cellCF, source, options)
+				chunkPart.Parent = model
+				alive += 1
+				grid[key(ix,iy,iz)] = {
+					Part = chunkPart,
+					GridIndex = Vector3int16.new(ix,iy,iz),
+					Destroyed = false
+				}
+			end
+		end
+	end
+
+	-- Hide/replace the source part
+	local srcProps = {
+		Color = source.Color,
+		Material = source.Material,
+		Transparency = source.Transparency,
+		Reflectance = source.Reflectance,
+	}
+
+	-- Keep the overall object solid pre-break:
+	-- We anchor all chunks initially to make it walkable.
+	if not options.KeepAnchoredUntilHit then
+		for _, rec in pairs(grid) do
+			rec.Part.Anchored = false
+		end
+	end
+
+	model.Parent = source.Parent
+	source.Transparency = 1
+	source.CanCollide = false
+	source.CanQuery = false
+	source.CanTouch = false
+
+	return {
+		Model = model,
+		ChunkSize = chunkSize,
+		Options = options,
+		Grid = grid,
+		AliveCount = alive,
+		SourceProps = srcProps,
+		BoundsCFrame = cf,
+		BoundsSize = size,
+		Regenerating = false,
+	}
+end
+
+-- Apply an impulse to a chunk and unanchor it (ejected debris).
+local function eject(rec: ChunkRecord, hitPos: Vector3, impulseMag: number, collisionGroup: string?)
+	if rec.Destroyed then return end
+	rec.Destroyed = true
+	local p = rec.Part
+	p.Anchored = false
+	if collisionGroup then
+		p.CollisionGroup = collisionGroup
+	end
+
+	-- Simple explosion impulse
+	local dir = (p.Position - hitPos)
+	if dir.Magnitude < 0.001 then
+		dir = Vector3.new(0,1,0)
+	end
+	dir = dir.Unit
+	local bv = Instance.new("BodyVelocity")
+	bv.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+	bv.Velocity = dir * impulseMag
+	bv.Parent = p
+	Debris:AddItem(bv, 0.15)
+
+	-- Optional spin
+	local av = Instance.new("BodyAngularVelocity")
+	av.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+	av.AngularVelocity = Vector3.new(math.random(), math.random(), math.random()) * impulseMag/20
+	av.Parent = p
+	Debris:AddItem(av, 0.2)
+end
+
+-- Public API object
+local Active: {[Model]: DestructibleState} = {}
+
+function DestructibleModule.Attach(part: BasePart, options: DestructibleOptions?): Model
+	assert(part and part:IsA("BasePart"), "Attach expects a BasePart")
+	local state = DestructibleModule._voxelize(part, options or {})
+	Active[state.Model] = state
+	return state.Model
+end
+
+-- Damage subset of chunks within radius of point
+function DestructibleModule.Blast(modelOrPart: Instance, position: Vector3, radius: number, impulse: number)
+	local model: Model? = nil
+	if modelOrPart:IsA("Model") then
+		model = modelOrPart :: Model
+	elseif modelOrPart:IsA("BasePart") then
+		model = modelOrPart:FindFirstAncestorOfClass("Model")
+	end
+	if not model or not Active[model] then return end
+	local state = Active[model]
+	local r2 = radius * radius
+	local removedMin: Vector3? = nil
+	local removedMax: Vector3? = nil
+
+	for _, rec in pairs(state.Grid) do
+		if not rec.Destroyed then
+			local p = rec.Part
+			local d2 = (p.Position - position).Magnitude^2
+			if d2 <= r2 then
+				-- "Destroyed": eject this chunk
+				eject(rec, position, impulse, state.Options.CollisionGroup)
+				state.AliveCount -= 1
+				-- track destroyed area AABB for regen blocking
+				local minB = p.Position - p.Size * 0.5
+				local maxB = p.Position + p.Size * 0.5
+
+				if removedMin == nil then
+					-- first destroyed chunk initializes the box
+					removedMin = minB
+					removedMax = maxB
+				else
+					-- narrow/cast optionals before field access
+					local rmin = (removedMin :: Vector3)
+					local rmax = (removedMax :: Vector3)
+
+					removedMin = Vector3.new(
+						math.min(rmin.X, minB.X),
+						math.min(rmin.Y, minB.Y),
+						math.min(rmin.Z, minB.Z)
+					)
+					removedMax = Vector3.new(
+						math.max(rmax.X, maxB.X),
+						math.max(rmax.Y, maxB.Y),
+						math.max(rmax.Z, maxB.Z)
+					)
+				end
+
+			end
+		end
+	end
+
+	-- Regen timer (per blast), but skip if already regenerating
+	if removedMin and not state.Regenerating then
+		state.Regenerating = true
+		task.spawn(function()
+			local delaySec = state.Options.RegenerateAfter or DEFAULTS.RegenerateAfter :: number
+			-- Wait until area is clear of players
+			local minV = removedMin :: Vector3
+			local maxV = removedMax :: Vector3
+			local deadline = os.clock() + 10*delaySec -- hard cap so it eventually returns
+			repeat
+				task.wait(delaySec)
+			until not AABBContainsHumanoid(minV, maxV) or os.clock() > deadline
+
+			-- Rebuild ejected chunks
+			for _, rec in pairs(state.Grid) do
+				if rec.Destroyed then
+					rec.Destroyed = false
+					local p = rec.Part
+					p.AssemblyLinearVelocity = Vector3.zero
+					p.AssemblyAngularVelocity = Vector3.zero
+					p.Anchored = true
+					p.CFrame = p.CFrame -- (snap as-is; if you want a smooth tween back, add TweenService here)
+				end
+			end
+			state.AliveCount = 0
+			for _, rec in pairs(state.Grid) do
+				if not rec.Destroyed then
+					state.AliveCount += 1
+				end
+			end
+			state.Regenerating = false
+		end)
+	end
+end
+
+-- Optional: clean up / detach (restore original part behavior if you kept a reference)
+function DestructibleModule.Detach(model: Model)
+	Active[model] = nil
+	model:Destroy()
+end
+
+return DestructibleModule
