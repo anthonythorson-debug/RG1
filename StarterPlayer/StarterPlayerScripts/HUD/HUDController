@@ -1,0 +1,83 @@
+-- Services
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Config & store
+local StatsConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("StatsConfig"))
+local StatsStore  = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("StatsStore"))
+
+-- RemoteEvents
+local RE = ReplicatedStorage:WaitForChild("RemoteEvents")
+local Combat = RE:WaitForChild("Combat")
+local ManaRE = RE:WaitForChild("Mana")
+local PlayerDamaged   = Combat:WaitForChild("PlayerDamaged")
+local KillConfirmed   = Combat:WaitForChild("KillConfirmed")
+local SpendConfirmed  = ManaRE:WaitForChild("SpendConfirmed")
+
+-- UI
+local player = Players.LocalPlayer
+local gui = player:WaitForChild("PlayerGui"):WaitForChild("HUDGui")
+local barsContainer = gui:WaitForChild("Bars")
+local healthImg = barsContainer:WaitForChild("Health")
+local manaImg   = barsContainer:WaitForChild("Mana")
+local tpImg     = barsContainer:WaitForChild("TruePotential")
+
+local BarComponent = require(script.Parent:WaitForChild("BarComponent"))
+
+-- Build components
+local healthBar = BarComponent.new(healthImg, StatsConfig.FillTweenTime, false) -- drains top->bottom
+local manaBar   = BarComponent.new(manaImg,   StatsConfig.FillTweenTime, false) -- drains top->bottom
+local tpBar     = BarComponent.new(tpImg,     StatsConfig.FillTweenTime, true)  -- fills bottom->top
+
+-- Store
+local store = StatsStore.new()
+
+local function refreshAll()
+	healthBar:setPercent(store:pct("health"))
+	manaBar:setPercent(store:pct("mana"))
+
+	-- Placeholder TruePotential rule: increase as health decreases
+	local hp = store:pct("health")
+	local tpPct = 1 - hp
+	store:set("tp", math.floor(tpPct * store.tp.max + 0.5))
+	tpBar:setPercent(tpPct)
+end
+
+-- React to direct stat changes (if we ever set them)
+store.changed.Event:Connect(function(name, cur, max)
+	if name == "health" then
+		healthBar:setPercent(store:pct("health"))
+	elseif name == "mana" then
+		manaBar:setPercent(store:pct("mana"))
+	elseif name == "tp" then
+		tpBar:setPercent(store:pct("tp"))
+	end
+end)
+
+-- Remote wiring
+-- 1) You took damage (server authoritative)
+--    args: damage:number, newCurrent:number, newMax:number? (optional)
+PlayerDamaged.OnClientEvent:Connect(function(damage, newCur, newMax)
+	if typeof(newMax) == "number" then store:set("health", newCur, newMax)
+	elseif typeof(newCur) == "number" then store:set("health", newCur)
+	else store:delta("health", -(damage or 0)) end
+	refreshAll()
+end)
+
+-- 2) Mana spend confirmed (server authoritative)
+--    args: amount:number, newCurrent:number, newMax:number? (optional)
+SpendConfirmed.OnClientEvent:Connect(function(amount, newCur, newMax)
+	if typeof(newMax) == "number" then store:set("mana", newCur, newMax)
+	elseif typeof(newCur) == "number" then store:set("mana", newCur)
+	else store:delta("mana", -(amount or 0)) end
+	refreshAll()
+end)
+
+-- 3) Kill confirmed (for later true XP system; no stat effect now)
+--    args: killerUserId:number, victimUserId:number
+KillConfirmed.OnClientEvent:Connect(function(killer, victim)
+	-- No change for TP now (TP is tied to HP). We keep this for future leveling logic.
+end)
+
+-- Init draw
+refreshAll()
