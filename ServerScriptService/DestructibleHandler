@@ -1,0 +1,528 @@
+-- DestructibleHandler (ServerScriptService)
+print("[DestructibleHandler] ✅ Running – pre-chunking all models…")
+
+local RS       = game:GetService("ReplicatedStorage")
+local Players  = game:GetService("Players")
+local Debris   = game:GetService("Debris")
+
+local explosionEvent = RS:WaitForChild("ExplosionEvent")
+local folder         = workspace:WaitForChild("DestructibleObjects")
+local terrain        = workspace:WaitForChild("Terrain")
+
+
+
+-- Tuning
+local REBUILD_DELAY          = 10
+local DELETED_REBUILD_DELAY  = REBUILD_DELAY
+local MIN_DESTROY_PCT        = 0.80
+local MAX_DESTROY_PCT        = 0.90
+local BUBBLE_RADIUS          = 14  -- no-respawn bubble around players (studs)
+local rng                    = Random.new()
+
+-- Fixed-size partitioning (per server start you can randomize between 3..4)
+local function randomChunkSize()
+	local minSize, maxSize = 2.8, 3.5
+	return Vector3.new(
+		math.random(minSize, maxSize),
+		math.random(minSize, maxSize),
+		math.random(minSize, maxSize)
+	)
+end
+local FIXED_CHUNK_SIZE   = randomChunkSize()
+local MAX_CHUNKS_PER_AXIS = 64
+
+-- State: chunkData[model] = array of chunk infos
+-- chunk info fields:
+--   part, originalCFrame, originalSize, material, color, topSurf, botSurf, rebuilding, deleted, model
+-- chunk info fields (WHOLE-MODEL):
+--   isWhole=true, originalModelCFrame, originalModelSize, rebuilding, deleted, model, templateClone
+local chunkData = {}
+
+-- ===== Helpers =====
+
+
+
+-- Player inside the original Main AABB of a model?
+local function playerInsideMainBox(model, hrpPos: Vector3)
+	local main = model:FindFirstChild("Main")
+	if not main then return false end
+	local lp   = main.CFrame:PointToObjectSpace(hrpPos)
+	local half = main.Size / 2
+	return math.abs(lp.X) <= half.X and math.abs(lp.Y) <= half.Y and math.abs(lp.Z) <= half.Z
+end
+
+-- Sphere (center=HRP) vs chunk's original AABB
+local function sphereIntersectsAABB(center: Vector3, radius: number, boxCF: CFrame, boxSize: Vector3): boolean
+	local p  = boxCF:PointToObjectSpace(center)
+	local hx, hy, hz = boxSize.X/2, boxSize.Y/2, boxSize.Z/2
+	local cx = math.clamp(p.X, -hx, hx)
+	local cy = math.clamp(p.Y, -hy, hy)
+	local cz = math.clamp(p.Z, -hz, hz)
+	local dx, dy, dz = p.X - cx, p.Y - cy, p.Z - cz
+	return (dx*dx + dy*dy + dz*dz) <= (radius * radius)
+end
+
+-- True if ANY player's HRP is within bubbleRadius of this chunk's original box
+-- (no dependency on being "inside Main")
+local function chunkInsidePlayerBubble(info, bubbleRadius: number)
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local hrp = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			if info.isWhole then
+				local cf, size = info.originalModelCFrame, info.originalModelSize
+				if sphereIntersectsAABB(hrp.Position, bubbleRadius, cf, size) then
+					return true
+				end
+			else
+				if sphereIntersectsAABB(hrp.Position, bubbleRadius, info.originalCFrame, info.originalSize) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+
+-- Wait until the chunk is outside every player's bubble (stateless)
+local function waitUntilChunkOutsidePlayerBubbles(info, timeout, bubbleRadius)
+	bubbleRadius = bubbleRadius or BUBBLE_RADIUS
+	local t0 = os.clock()
+	while chunkInsidePlayerBubble(info, bubbleRadius) do
+		if timeout and (os.clock() - t0) > timeout then
+			return false
+		end
+		task.wait(0.2)
+	end
+	return true
+end
+
+
+-- (Re)create a chunk Part from saved info if needed
+local function ensureChunkPart(info, parentModel)
+	if info.part and info.part.Parent then return info.part end
+	local p = Instance.new("Part")
+	p.Size           = info.originalSize
+	p.Anchored       = true
+	p.CanCollide     = true
+	p.Material       = info.material
+	p.Color          = info.color
+	p.TopSurface     = info.topSurf
+	p.BottomSurface  = info.botSurf
+	p.CFrame         = info.originalCFrame
+	p.Parent         = parentModel:FindFirstChild("Chunks") or parentModel
+	info.part        = p
+	info.deleted     = false
+	return p
+end
+
+
+
+-- WHOLE-MODEL helpers (for multi-part props like trees)
+
+local function getAllBaseParts(root: Instance): {BasePart}
+	local parts = {}
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") then table.insert(parts, d) end
+	end
+	if root:IsA("BasePart") then table.insert(parts, root) end
+	return parts
+end
+
+local function ensurePrimaryPart(m: Model): BasePart
+	if m.PrimaryPart and m.PrimaryPart:IsA("BasePart") then return m.PrimaryPart end
+	local first = m:FindFirstChildWhichIsA("BasePart", true)
+	if first then m.PrimaryPart = first; return first end
+	error(("Model %s has no BasePart to use as PrimaryPart"):format(m:GetFullName()))
+end
+
+local function getModelBoundingBox(m: Model): (CFrame, Vector3)
+	local cf, size = m:GetBoundingBox()
+	return cf, size
+end
+
+-- Destroy an entire model (all BaseParts)
+local function destroyWholeModel(info)
+	if info.deleted then return end
+	info.deleted = true
+	local mdl = info.model
+	if not mdl or not mdl.Parent then return end
+
+	for _, bp in ipairs(getAllBaseParts(mdl)) do
+		bp:Destroy()
+	end
+end
+
+-- Rebuild an entire model from its cached pristine template
+local function rebuildWholeModel(info)
+	if not info.deleted or info.rebuilding then return end
+	info.rebuilding = true
+
+	local mdl = info.model
+	local parent = mdl and mdl.Parent or folder
+
+	-- Clone from saved template
+	local new = info.templateClone:Clone()
+	new.Parent = parent
+
+	-- Restore using the bounding box CFrame (PrimaryPart is not necessary, but nice to set)
+	local cf = info.originalModelCFrame
+	local size = info.originalModelSize
+	-- Try to preserve orientation via ModelPivot
+	new:PivotTo(cf)
+
+	-- Swap references
+	info.model = new
+	info.deleted = false
+	info.rebuilding = false
+end
+
+-- End of helpers
+-- ===== Pre-chunk models =====
+
+-- Register a whole-model destructible (no voxelization). Use this when:
+--  - Model has multiple parts (e.g., tree trunk + leaves)
+--  - You want it destroyed/rebuilt as a single unit
+local function registerWholeModel(model: Model)
+	-- Cache original transform/size from bounding box
+	local bbCF, bbSize = getModelBoundingBox(model)
+	-- Cache a pristine template for rebuilds
+	local template = model:Clone()
+
+	-- Mark (optional) to help debugging
+	model:SetAttribute("DestructMode", "WHOLE")
+
+	-- Store a single "info" entry
+	chunkData[model] = {
+		{
+			isWhole = true,
+			model = model,
+			originalModelCFrame = bbCF,
+			originalModelSize   = bbSize,
+			templateClone       = template,
+			rebuilding = false,
+			deleted    = false,
+		}
+	}
+end
+
+-- Generate chunks from a specific BasePart "source" inside the model.
+-- Appends chunk infos to "list" and parents new chunks into the model's Chunks folder.
+local function generateChunksFromSourcePart(model: Model, source: BasePart, list: {any}, chunksFolder: Folder)
+	local size = source.Size
+
+	-- Hide/disable the original source so only chunks render/collide
+	source.Transparency = 1
+	source.CanCollide   = false
+	source.CanTouch     = false
+	source.CanQuery     = false
+
+	local countX = math.clamp(math.ceil(size.X / FIXED_CHUNK_SIZE.X), 1, MAX_CHUNKS_PER_AXIS)
+	local countY = math.clamp(math.ceil(size.Y / FIXED_CHUNK_SIZE.Y), 1, MAX_CHUNKS_PER_AXIS)
+	local countZ = math.clamp(math.ceil(size.Z / FIXED_CHUNK_SIZE.Z), 1, MAX_CHUNKS_PER_AXIS)
+
+	local function cellSizeAt(i, axisLen, step)
+		local placed   = i * step
+		local remaining= axisLen - placed
+		return math.min(step, remaining)
+	end
+	local function centerOffsetAt(i, axisLen, step)
+		local thisSize = cellSizeAt(i, axisLen, step)
+		return (-axisLen/2) + (i * step) + (thisSize / 2)
+	end
+
+	for xi = 0, countX - 1 do
+		for yi = 0, countY - 1 do
+			for zi = 0, countZ - 1 do
+				local sx = cellSizeAt(xi, size.X, FIXED_CHUNK_SIZE.X)
+				local sy = cellSizeAt(yi, size.Y, FIXED_CHUNK_SIZE.Y)
+				local sz = cellSizeAt(zi, size.Z, FIXED_CHUNK_SIZE.Z)
+
+				local ox = centerOffsetAt(xi, size.X, FIXED_CHUNK_SIZE.X)
+				local oy = centerOffsetAt(yi, size.Y, FIXED_CHUNK_SIZE.Y)
+				local oz = centerOffsetAt(zi, size.Z, FIXED_CHUNK_SIZE.Z)
+
+				local chunk = Instance.new("Part")
+				chunk.Size          = Vector3.new(sx, sy, sz)
+				chunk.Anchored      = true
+				chunk.CanCollide    = true
+				chunk.Material      = source.Material
+				chunk.Color         = source.Color
+				chunk.TopSurface    = Enum.SurfaceType.Smooth
+				chunk.BottomSurface = Enum.SurfaceType.Smooth
+				chunk.CFrame        = source.CFrame * CFrame.new(ox, oy, oz)
+				chunk.Parent        = chunksFolder
+
+				table.insert(list, {
+					part           = chunk,
+					originalCFrame = chunk.CFrame,
+					originalSize   = chunk.Size,
+					material       = chunk.Material,
+					color          = chunk.Color,
+					topSurf        = chunk.TopSurface,
+					botSurf        = chunk.BottomSurface,
+					rebuilding     = false,
+					deleted        = false,
+					model          = model,
+				})
+			end
+		end
+	end
+end
+
+
+-- Multi-source chunking:
+-- - Any child BasePart named "Main" is a chunk source (backward compatible)
+-- - Any BasePart with Attribute "DestructSource" == true is also a chunk source
+-- - All chunks for the model go under a single "Chunks" folder
+local function generateChunks(model)
+	-- Collect sources
+	local sources = {}
+
+	-- 1) Parts named "Main" (old behavior)
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") and child.Name == "Main" then
+			table.insert(sources, child)
+		end
+	end
+
+	-- 2) Any descendant BasePart tagged with attribute DestructSource=true
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and d:GetAttribute("DestructSource") == true then
+			-- avoid duplicates if someone named it Main too
+			local already = false
+			for _, s in ipairs(sources) do
+				if s == d then already = true; break end
+			end
+			if not already then table.insert(sources, d) end
+		end
+	end
+
+	if #sources == 0 then
+		warn(("[DestructibleHandler] No chunk sources found in model %s (need a 'Main' part or set DestructSource=true)"):format(model:GetFullName()))
+		return
+	end
+
+	-- Prepare folder once per model
+	local chunksFolder = model:FindFirstChild("Chunks")
+	if chunksFolder then chunksFolder:Destroy() end
+	chunksFolder = Instance.new("Folder")
+	chunksFolder.Name = "Chunks"
+	chunksFolder.Parent = model
+
+	-- Build chunk list (append from each source)
+	local list = {}
+
+	for _, source in ipairs(sources) do
+		generateChunksFromSourcePart(model, source, list, chunksFolder)
+	end
+
+	-- Save combined chunk list
+	chunkData[model] = list
+end
+
+
+for _, model in ipairs(folder:GetChildren()) do
+	if model:IsA("Model") then
+		-- RULE:
+		--  1) If model has a child named "Main" => voxelize (your current behavior)
+		--  2) Else if model has Attribute "DestructAsWhole" == true => WHOLE-MODEL
+		--  3) Else (no Main) => default to WHOLE-MODEL (good for trees/props)
+
+		if model:FindFirstChild("Main") then
+			generateChunks(model)
+		else
+			-- Optional override with attribute, but defaulting to whole is ergonomic for props
+			local asWhole = model:GetAttribute("DestructAsWhole")
+			if asWhole == nil or asWhole == true then
+				registerWholeModel(model)
+			end
+		end
+	end
+
+end
+print("[DestructibleHandler] ✅ All models pre-chunked.")
+
+-- ===== Explosion handler =====
+
+explosionEvent.Event:Connect(function(origin, radius, isTerrain)
+	if typeof(origin) == "table" then
+		-- Try common keys
+		origin = origin.pos or origin.position or origin.origin or origin.center or origin
+		-- If still a table with numeric fields, build a Vector3
+		if typeof(origin) == "table" then
+			local x = tonumber(origin.x or origin.X or 0) or 0
+			local y = tonumber(origin.y or origin.Y or 0) or 0
+			local z = tonumber(origin.z or origin.Z or 0) or 0
+			origin = Vector3.new(x, y, z)
+		end
+	end
+	radius = tonumber(radius) or 0
+	if typeof(isTerrain) ~= "boolean" then
+		isTerrain = false
+	end
+	
+	local r = tonumber(radius) or 0
+	print(("[DestructibleHandler] 🔥 Blast at %s | r=%.1f"):format(tostring(origin), r))
+
+
+	if not isTerrain then
+		for model, list in pairs(chunkData) do
+			if #list == 0 then continue end
+
+			-- Case 1: WHOLE-MODEL destructible (single entry, list[1].isWhole == true)
+			if list[1].isWhole then
+				local info = list[1]
+				-- Distance check via bounding box center
+				local center = info.originalModelCFrame.Position
+				if (center - origin).Magnitude <= radius then
+					-- destroy entire model and schedule rebuild (respect player bubble)
+					if not info.rebuilding and not info.deleted then
+						destroyWholeModel(info)
+
+						task.delay(DELETED_REBUILD_DELAY, function()
+							-- emulate bubble check using whole-model bounds
+							local ok = waitUntilChunkOutsidePlayerBubbles(info, 30, BUBBLE_RADIUS)
+							if not ok then
+								-- retry a bit later
+								task.delay(2, function()
+									if info.deleted and not info.rebuilding then
+										local ok2 = waitUntilChunkOutsidePlayerBubbles(info, 30, BUBBLE_RADIUS)
+										if ok2 then rebuildWholeModel(info) end
+									end
+								end)
+								return
+							end
+							if info.deleted then rebuildWholeModel(info) end
+						end)
+					end
+				end
+
+				-- Case 2: CHUNKED destructible (your existing behavior)
+			else
+				-- collect intact chunks inside radius
+				local candidates = {}
+				for _, info in ipairs(list) do
+					local c = info.part
+					if c and c.Parent and c.Anchored then
+						if (c.Position - origin).Magnitude <= radius then
+							table.insert(candidates, info)
+						end
+					end
+				end
+
+				if #candidates > 0 then
+					local destroyPct   = rng:NextNumber(MIN_DESTROY_PCT, MAX_DESTROY_PCT)
+					local destroyCount = math.floor(#candidates * destroyPct + 0.5)
+
+					-- shuffle
+					for i = #candidates, 2, -1 do
+						local j = rng:NextInteger(1, i)
+						candidates[i], candidates[j] = candidates[j], candidates[i]
+					end
+
+					-- 1) delete subset
+					for i = 1, destroyCount do
+						local info = candidates[i]
+						local c    = info.part
+						if c and c.Parent then
+							c:Destroy()
+							info.part    = nil
+							info.deleted = true
+
+							if not info.rebuilding then
+								info.rebuilding = true
+								local mdl = info.model -- freeze model for this callback
+								task.delay(DELETED_REBUILD_DELAY, function()
+									local clear = waitUntilChunkOutsidePlayerBubbles(info, 30, BUBBLE_RADIUS)
+									if not clear then
+										info.rebuilding = false
+										task.delay(2, function()
+											if not info.rebuilding and info.deleted then
+												info.rebuilding = true
+												if waitUntilChunkOutsidePlayerBubbles(info, 30, BUBBLE_RADIUS) and info.deleted then
+													local p = ensureChunkPart(info, mdl)
+													p.CFrame = info.originalCFrame
+													p.Anchored = true
+													p.CanCollide = true
+													info.deleted = false
+												end
+												info.rebuilding = false
+											end
+										end)
+										return
+									end
+
+									if info.deleted then
+										local p = ensureChunkPart(info, mdl)
+										p.CFrame = info.originalCFrame
+										p.Anchored = true
+										p.CanCollide = true
+										info.deleted = false
+									end
+									info.rebuilding = false
+								end)
+							end
+						end
+					end
+
+					-- 2) fling the rest
+					for i = destroyCount + 1, #candidates do
+						local info = candidates[i]
+						local c    = info.part
+						if c and c.Parent and c.Anchored then
+							c.Anchored   = false
+							c.CanCollide = true
+							local dir    = (c.Position - origin).Unit
+							local mass   = c:GetMass()
+							c:ApplyImpulse(dir * (50 * mass))
+
+							if not info.rebuilding then
+								info.rebuilding = true
+								local mdl = info.model -- freeze model for this callback
+								task.delay(REBUILD_DELAY, function()
+									local clear = waitUntilChunkOutsidePlayerBubbles(info, 30, BUBBLE_RADIUS)
+									if not clear then
+										info.rebuilding = false
+										task.delay(2, function()
+											if not info.rebuilding then
+												info.rebuilding = true
+												if waitUntilChunkOutsidePlayerBubbles(info, 30, BUBBLE_RADIUS) then
+													if info.part and info.part.Parent then
+														local p = info.part
+														p.CFrame = info.originalCFrame
+														p.AssemblyLinearVelocity  = Vector3.zero
+														p.AssemblyAngularVelocity = Vector3.zero
+														p.Anchored = true
+														p.CanCollide = true
+													else
+														ensureChunkPart(info, mdl)
+													end
+												end
+												info.rebuilding = false
+											end
+										end)
+										return
+									end
+
+									if info.part and info.part.Parent then
+										local p = info.part
+										p.CFrame = info.originalCFrame
+										p.AssemblyLinearVelocity  = Vector3.zero
+										p.AssemblyAngularVelocity = Vector3.zero
+										p.Anchored = true
+										p.CanCollide = true
+									else
+										ensureChunkPart(info, mdl)
+									end
+									info.rebuilding = false
+								end)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	
+end)
